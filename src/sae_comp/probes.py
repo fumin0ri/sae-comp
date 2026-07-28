@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import json
 from collections import Counter
 from pathlib import Path
@@ -13,6 +14,30 @@ from tqdm import tqdm
 
 from .config import ExperimentConfig
 from .evaluation import load_method
+
+
+def _load_spacy_model() -> Any:
+    try:
+        spacy = importlib.import_module("spacy")
+    except ModuleNotFoundError as exc:
+        missing = exc.name or "unknown"
+        if missing == "spacy":
+            raise RuntimeError(
+                "MMLU syntax probes require `pip install -e '.[probe]'`"
+            ) from exc
+        raise RuntimeError(
+            "spaCy could not start because runtime dependency "
+            f"`{missing}` is missing. Repair the probe environment with "
+            "`python -m pip install --upgrade -e '.[probe]'`."
+        ) from exc
+    try:
+        return spacy.load("en_core_web_sm", disable=["ner", "lemmatizer", "textcat"])
+    except OSError as exc:
+        raise RuntimeError(
+            "spaCy model en_core_web_sm is missing; repair the probe "
+            "environment with "
+            "`python -m pip install --upgrade -e '.[probe]'`."
+        ) from exc
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -51,18 +76,7 @@ def extract_mmlu_probe_cache(cfg: ExperimentConfig, overwrite: bool = False) -> 
     output = Path(cfg.run_dir) / "evaluation" / "mmlu_probe_cache.pt"
     if output.exists() and not overwrite:
         return output
-    try:
-        import spacy
-    except ImportError as exc:
-        raise RuntimeError(
-            "MMLU syntax probes require `pip install -e '.[probe]'`"
-        ) from exc
-    try:
-        nlp = spacy.load("en_core_web_sm", disable=["ner", "lemmatizer", "textcat"])
-    except OSError as exc:
-        raise RuntimeError(
-            "spaCy model en_core_web_sm is missing; install the probe extra"
-        ) from exc
+    nlp = _load_spacy_model()
 
     device = torch.device(cfg.train.device)
     tokenizer = AutoTokenizer.from_pretrained(

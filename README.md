@@ -72,6 +72,14 @@ python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/
 python -m pip install -e '.[probe]'
 ```
 
+既存環境で`No module named 'click'`などspaCyの依存エラーが出た場合は、更新後の
+probe extraで環境を修復してください。
+
+```bash
+git pull origin main
+python -m pip install --upgrade -e '.[probe]'
+```
+
 Hugging Faceで認証が必要な場合だけtokenを設定します。
 
 ```bash
