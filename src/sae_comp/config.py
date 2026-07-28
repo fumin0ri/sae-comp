@@ -88,6 +88,9 @@ class EvalConfig:
     probe_tokens_per_question: int = 25
     probe_train_rows: int = 3_000
     probe_sparsities: tuple[int, ...] = (1, 5, 10, 20)
+    probe_max_iter: int = 200
+    probe_tolerance: float = 1e-3
+    probe_include_dense: bool = True
     mmlu_dataset: str = "cais/mmlu"
     mmlu_revision: str = "c30699e8356da336a370243923dbaf21066bb9fe"
     probe_subjects: tuple[str, ...] = (

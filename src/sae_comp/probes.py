@@ -9,7 +9,8 @@ from typing import Any
 
 import numpy as np
 import torch
-from sklearn.linear_model import LogisticRegression
+from scipy.sparse import csr_matrix
+from sklearn.linear_model import SGDClassifier
 from tqdm import tqdm
 
 from .config import ExperimentConfig
@@ -197,16 +198,36 @@ def _stratified_token_split(
     return np.asarray(train), np.asarray(test)
 
 
-def _select_features(x: np.ndarray, labels: np.ndarray, per_class: int) -> np.ndarray:
-    selected: set[int] = set()
+def _feature_rankings(
+    x: np.ndarray, labels: np.ndarray, maximum_per_class: int
+) -> dict[int, np.ndarray]:
+    """Rank mean-difference features once and reuse them at every sparsity."""
+
+    rankings: dict[int, np.ndarray] = {}
+    total = x.sum(axis=0, dtype=np.float64)
+    rows = len(x)
     for label in np.unique(labels):
-        positive = x[labels == label].mean(axis=0)
-        negative = x[labels != label].mean(axis=0)
+        mask = labels == label
+        positive_rows = int(mask.sum())
+        negative_rows = rows - positive_rows
+        positive_sum = x[mask].sum(axis=0, dtype=np.float64)
+        positive = positive_sum / max(positive_rows, 1)
+        negative = (total - positive_sum) / max(negative_rows, 1)
         scores = positive - negative
-        count = min(per_class, x.shape[1])
+        count = min(maximum_per_class, x.shape[1])
         indices = np.argpartition(scores, -count)[-count:]
-        selected.update(int(index) for index in indices)
-    return np.asarray(sorted(selected), dtype=np.int64)
+        rankings[int(label)] = indices[np.argsort(scores[indices])[::-1]].astype(
+            np.int64
+        )
+    return rankings
+
+
+def _select_ranked_features(
+    rankings: dict[int, np.ndarray], per_class: int
+) -> np.ndarray:
+    return np.unique(
+        np.concatenate([indices[:per_class] for indices in rankings.values()])
+    )
 
 
 def _fit_probe(
@@ -214,26 +235,42 @@ def _fit_probe(
     labels: np.ndarray,
     train_indices: np.ndarray,
     test_indices: np.ndarray,
-    sparsity: int | None,
-) -> tuple[float, int]:
+    selected: np.ndarray | None,
+    max_iter: int,
+    tolerance: float,
+) -> tuple[float, int, int]:
     train_x = features[train_indices]
     test_x = features[test_indices]
     train_y = labels[train_indices]
     test_y = labels[test_indices]
-    if sparsity is not None:
-        selected = _select_features(train_x, train_y, sparsity)
+    if selected is not None:
         train_x = train_x[:, selected]
         test_x = test_x[:, selected]
     else:
         selected = np.arange(features.shape[1])
-    classifier = LogisticRegression(
-        max_iter=1_000,
-        solver="saga",
+    train_x = csr_matrix(train_x, dtype=np.float32)
+    test_x = csr_matrix(test_x, dtype=np.float32)
+    class_count = len(np.unique(train_y))
+    validation_fraction = max(0.1, min(0.25, (class_count + 1) / max(len(train_y), 1)))
+    classifier = SGDClassifier(
+        loss="log_loss",
+        penalty="l2",
+        alpha=1e-4,
+        max_iter=max_iter,
+        tol=tolerance,
+        early_stopping=True,
+        validation_fraction=validation_fraction,
+        n_iter_no_change=5,
+        average=True,
+        class_weight="balanced",
         random_state=0,
-        n_jobs=-1,
     )
     classifier.fit(train_x, train_y)
-    return float(classifier.score(test_x, test_y)), len(selected)
+    return (
+        float(classifier.score(test_x, test_y)),
+        len(selected),
+        int(classifier.n_iter_),
+    )
 
 
 @torch.inference_mode()
@@ -248,14 +285,43 @@ def evaluate_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
     }
     device = torch.device(cfg.train.device)
     run_dir = Path(cfg.run_dir)
-    results: list[dict[str, Any]] = []
+    output_dir = run_dir / "evaluation"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    progress_path = output_dir / "probes_progress.json"
+    progress_data: dict[str, Any] = {}
+    if progress_path.exists():
+        progress_data = json.loads(progress_path.read_text(encoding="utf-8"))
+    if progress_data.get("config_fingerprint") == cfg.fingerprint():
+        results: list[dict[str, Any]] = progress_data.get("results", [])
+    else:
+        results = []
+    completed = {
+        (
+            result["method"],
+            result["split"],
+            result["task"],
+            str(result["sparsity"]),
+        )
+        for result in results
+    }
+    sparsities: tuple[int | None, ...] = tuple(cfg.evaluation.probe_sparsities)
+    if cfg.evaluation.probe_include_dense:
+        sparsities = (*sparsities, None)
+    jobs_per_split = len(label_sets) * len(sparsities)
+    total_jobs = jobs_per_split * 5
+    progress = tqdm(
+        total=total_jobs,
+        initial=len(completed),
+        desc="linear probes",
+        unit="probe",
+    )
     for method in ("standard", "temporal", "proposal"):
         sae, _, _ = load_method(run_dir / "checkpoints" / f"{method}.pt", device)
         encoded_batches = []
         for start in range(0, len(activations), cfg.train.token_batch_size):
             batch = activations[start : start + cfg.train.token_batch_size].to(device)
             encoded_batches.append(sae.encode(batch, method).cpu())
-        all_features = torch.cat(encoded_batches).numpy()
+        all_features = torch.cat(encoded_batches).float().numpy()
         high = sae.cfg.high_size
         splits = {"full": all_features}
         if method == "temporal":
@@ -280,29 +346,68 @@ def evaluate_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
             )
             for split, features in splits.items():
                 task_features = features[keep]
-                for sparsity in (*cfg.evaluation.probe_sparsities, None):
-                    accuracy, selected = _fit_probe(
+                maximum = max(cfg.evaluation.probe_sparsities, default=1)
+                rankings = _feature_rankings(
+                    task_features[train_indices], task_labels[train_indices], maximum
+                )
+                for sparsity in sparsities:
+                    display_sparsity = "dense" if sparsity is None else sparsity
+                    key = (method, split, task, str(display_sparsity))
+                    if key in completed:
+                        continue
+                    selected_indices = (
+                        None
+                        if sparsity is None
+                        else _select_ranked_features(rankings, sparsity)
+                    )
+                    progress.set_postfix_str(
+                        f"{method}/{split}/{task}/k={display_sparsity}"
+                    )
+                    accuracy, selected, iterations = _fit_probe(
                         task_features,
                         task_labels,
                         train_indices,
                         test_indices,
-                        sparsity,
+                        selected_indices,
+                        cfg.evaluation.probe_max_iter,
+                        cfg.evaluation.probe_tolerance,
                     )
-                    results.append(
-                        {
-                            "method": method,
-                            "split": split,
-                            "task": task,
-                            "sparsity": ("dense" if sparsity is None else sparsity),
-                            "selected_features": selected,
-                            "accuracy": accuracy,
-                            "classes": len(classes),
-                            "train_rows": len(train_indices),
-                            "test_rows": len(test_indices),
-                        }
+                    result = {
+                        "method": method,
+                        "split": split,
+                        "task": task,
+                        "sparsity": display_sparsity,
+                        "selected_features": selected,
+                        "accuracy": accuracy,
+                        "classes": len(classes),
+                        "train_rows": len(train_indices),
+                        "test_rows": len(test_indices),
+                        "solver": "SGDClassifier(log_loss)",
+                        "iterations": iterations,
+                    }
+                    results.append(result)
+                    completed.add(key)
+                    progress_path.write_text(
+                        json.dumps(
+                            {
+                                "config_fingerprint": cfg.fingerprint(),
+                                "results": results,
+                            },
+                            indent=2,
+                        )
+                        + "\n",
+                        encoding="utf-8",
                     )
-    output_dir = run_dir / "evaluation"
-    output_dir.mkdir(parents=True, exist_ok=True)
+                    progress.update(1)
+    progress.close()
+    results.sort(
+        key=lambda item: (
+            item["method"],
+            item["split"],
+            item["task"],
+            str(item["sparsity"]),
+        )
+    )
     (output_dir / "probes.json").write_text(
         json.dumps(results, indent=2) + "\n", encoding="utf-8"
     )
@@ -310,4 +415,5 @@ def evaluate_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
         writer = csv.DictWriter(stream, fieldnames=list(results[0]))
         writer.writeheader()
         writer.writerows(results)
+    progress_path.unlink(missing_ok=True)
     return results

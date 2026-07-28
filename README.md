@@ -54,6 +54,10 @@ Standard controlも再構成のみで6,000 steps継続するため、Temporal/JE
 - sparse probes: 1、5、10、20 features/class、およびdense
 - Temporal SAEのみhigh/low splitを追加報告
 
+Probeは疎行列上の早期停止logistic-loss SGDで学習します。各probeの完了時に
+`probes_progress.json`へ保存するため、中断後に同じコマンドを実行すると続きから
+再開します。
+
 提案法についてはoffset 1..9のfuture-code cosine、normalized MSE、
 true-context minus shuffled-contextも補助診断として出力します。これは提案法固有の
 指標であり、3手法の共通比較とは分けて報告します。
