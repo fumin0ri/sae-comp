@@ -1,0 +1,87 @@
+run_dir = "runs/controlled-pythia160m"
+activation_dir = "data/pythia160m-layer8"
+
+[model]
+name = "EleutherAI/pythia-160m"
+revision = "step143000"
+layer = 8
+dtype = "bfloat16"
+
+[data]
+dataset = "EleutherAI/the_pile_deduplicated"
+dataset_config = "default"
+revision = "fcbfcfde4222cbb1acd1d33bad0be250ee14b1bb"
+split = "train"
+text_field = "text"
+sequence_length = 128
+min_valid_tokens = 32
+train_sequences = 40960
+validation_sequences = 1024
+shard_sequences = 256
+extraction_batch_size = 16
+validation_fraction = 0.05
+shuffle_buffer = 10000
+
+[sae]
+dictionary_size = 16384
+k = 20
+high_fraction = 0.2
+temporal_alpha = 1.0
+contrastive_temperature = 1.0
+high_reconstruction_weight = 0.2
+full_reconstruction_weight = 0.8
+auxiliary_weight = 0.03125
+threshold_beta = 0.999
+dead_token_threshold = 10000000
+
+[train]
+seed = 42
+standard_steps = 12000
+branch_steps = 6000
+token_batch_size = 512
+window_batch_size = 32
+gradient_accumulation_steps = 1
+standard_lr = 0.0002
+temporal_lr = 0.0002
+proposal_sae_lr = 0.0001
+proposal_predictor_lr = 0.0003
+warmup_steps = 500
+gradient_clip = 1.0
+log_every = 100
+amp_dtype = "bfloat16"
+device = "cuda"
+
+[proposal]
+window_size = 10
+predictor_width = 256
+predictor_expansion = 2
+predictor_warmup_steps = 800
+prediction_ramp_steps = 800
+prediction_weight = 1.0
+residual_prediction_weight = 0.1
+variance_weight = 0.01
+variance_target = 1.0
+ema_decay = 0.996
+
+[evaluation]
+batch_sequences = 8
+max_sequences = 1024
+probe_questions = 160
+probe_tokens_per_question = 25
+probe_train_rows = 3000
+probe_sparsities = [1, 5, 10, 20]
+mmlu_dataset = "cais/mmlu"
+mmlu_revision = "c30699e8356da336a370243923dbaf21066bb9fe"
+probe_subjects = [
+  "world_religions",
+  "professional_law",
+  "high_school_european_history",
+  "high_school_macroeconomics",
+  "high_school_biology",
+  "high_school_mathematics",
+  "professional_medicine",
+  "prehistory",
+  "moral_disputes",
+  "business_ethics",
+]
+bootstrap_samples = 2000

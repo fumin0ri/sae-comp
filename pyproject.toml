@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sae-comp"
+version = "0.1.0"
+description = "Controlled comparison of standard, temporal, and transition-JEPA sparse autoencoders"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "accelerate>=0.30",
+  "datasets>=2.20,<4",
+  "numpy>=1.26,<3",
+  "scikit-learn>=1.4,<2",
+  "torch>=2.5,<3",
+  "tqdm>=4.66",
+  "transformers>=4.44,<5",
+]
+
+[project.optional-dependencies]
+probe = [
+  "spacy>=3.8,<4",
+  "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+]
+dev = ["pytest>=8", "ruff>=0.9"]
+
+[project.scripts]
+sae-comp = "sae_comp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
