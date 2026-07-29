@@ -69,6 +69,9 @@ class TrainConfig:
 @dataclass(frozen=True)
 class ProposalConfig:
     window_size: int = 10
+    window_sizes: tuple[int, ...] = (8, 16, 32, 64, 128)
+    sweep_tokens_per_step: int = 512
+    sweep_forecast_pairs_per_step: int = 448
     predictor_width: int = 256
     predictor_expansion: int = 2
     predictor_warmup_steps: int = 800
@@ -78,6 +81,30 @@ class ProposalConfig:
     variance_weight: float = 0.01
     variance_target: float = 1.0
     ema_decay: float = 0.996
+
+    def sweep_budget(self, window_size: int) -> dict[str, int]:
+        if self.sweep_tokens_per_step % window_size:
+            raise ValueError(
+                "sweep_tokens_per_step must be divisible by every proposal window size"
+            )
+        batch_windows = self.sweep_tokens_per_step // window_size
+        if self.sweep_forecast_pairs_per_step % batch_windows:
+            raise ValueError(
+                "sweep_forecast_pairs_per_step must be divisible by batch windows"
+            )
+        offsets_per_window = self.sweep_forecast_pairs_per_step // batch_windows
+        if not 1 <= offsets_per_window < window_size:
+            raise ValueError(
+                "sweep forecast budget must sample between 1 and window_size - 1 "
+                "offsets per window"
+            )
+        return {
+            "window_size": window_size,
+            "batch_windows": batch_windows,
+            "reconstruction_tokens_per_step": self.sweep_tokens_per_step,
+            "forecast_offsets_per_window": offsets_per_window,
+            "forecast_pairs_per_step": self.sweep_forecast_pairs_per_step,
+        }
 
 
 @dataclass(frozen=True)
@@ -128,6 +155,18 @@ class ExperimentConfig:
             raise ValueError("validation_fraction must lie in (0, 1)")
         if self.data.min_valid_tokens < self.proposal.window_size:
             raise ValueError("min_valid_tokens must be at least proposal.window_size")
+        if not self.proposal.window_sizes:
+            raise ValueError("proposal.window_sizes must not be empty")
+        if len(set(self.proposal.window_sizes)) != len(self.proposal.window_sizes):
+            raise ValueError("proposal.window_sizes must be unique")
+        for window_size in self.proposal.window_sizes:
+            if window_size < 2:
+                raise ValueError("proposal window sizes must be at least 2")
+            if window_size > self.data.sequence_length:
+                raise ValueError(
+                    "sequence_length must be at least every proposal window size"
+                )
+            self.proposal.sweep_budget(window_size)
         if self.sae.k < 1 or self.sae.k > self.sae.dictionary_size:
             raise ValueError("sae.k must lie in [1, dictionary_size]")
         if not 0 < self.sae.high_fraction < 1:
@@ -139,6 +178,7 @@ class ExperimentConfig:
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
+        value["proposal"]["window_sizes"] = list(self.proposal.window_sizes)
         value["evaluation"]["probe_sparsities"] = list(self.evaluation.probe_sparsities)
         value["evaluation"]["probe_subjects"] = list(self.evaluation.probe_subjects)
         return value

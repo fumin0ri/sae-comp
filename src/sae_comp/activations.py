@@ -346,8 +346,14 @@ class ActivationStore:
             epoch += 1
 
     def window_batches(
-        self, batch_size: int, window_size: int
+        self,
+        batch_size: int,
+        window_size: int,
+        minimum_sequence_length: int | None = None,
     ) -> Iterator[torch.Tensor]:
+        minimum_length = minimum_sequence_length or window_size
+        if minimum_length < window_size:
+            raise ValueError("minimum_sequence_length must be at least window_size")
         generator = torch.Generator().manual_seed(self.seed + 2)
         epoch = 0
         while True:
@@ -358,6 +364,7 @@ class ActivationStore:
                 starts = [
                     (row, start)
                     for row, length in enumerate(lengths)
+                    if int(length) >= minimum_length
                     for start in range(int(length) - window_size + 1)
                 ]
                 order = torch.randperm(len(starts), generator=generator)

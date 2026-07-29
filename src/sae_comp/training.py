@@ -69,6 +69,7 @@ def _save_checkpoint(
     model_config: dict[str, Any],
     cfg: ExperimentConfig,
     manifest: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -80,6 +81,7 @@ def _save_checkpoint(
             "experiment_config": cfg.as_dict(),
             "config_fingerprint": cfg.fingerprint(),
             "activation_config_fingerprint": manifest["config_fingerprint"],
+            "metadata": metadata or {},
             "source": {
                 "proposal": "https://github.com/fumin0ri/my-sae",
                 "temporal": ("https://github.com/AI4LIFE-GROUP/temporal-saes"),
@@ -294,8 +296,9 @@ def _proposal_loss(
     windows: torch.Tensor,
     prediction_weight: float,
     cfg: ExperimentConfig,
+    offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    output = model(windows)
+    output = model(windows, offsets)
     reconstruction = _fvu(output["reconstruction"], windows)
     prediction = output["prediction"]
     targets = output["targets"].detach()
@@ -305,7 +308,9 @@ def _proposal_loss(
         dim=-1
     ) / target_energy
     prediction_loss = (1 - cosine + 0.25 * normalized_mse).mean()
-    residual_prediction = _fvu(output["predicted_residual"], windows[:, 1:])
+    residual_prediction = _fvu(
+        output["predicted_residual"], output["target_residual"]
+    )
     state_std = output["state"].float().std(dim=0, unbiased=False)
     variance = F.relu(cfg.proposal.variance_target - state_std).mean()
     loss = (
@@ -332,11 +337,30 @@ def _train_proposal(
     model: TransitionJEPA,
     store: ActivationStore,
     cfg: ExperimentConfig,
+    *,
+    window_batch_size: int | None = None,
+    forecast_pairs_per_step: int | None = None,
+    minimum_sequence_length: int | None = None,
+    description: str = "transition JEPA",
 ) -> list[dict[str, float | int | str]]:
     device = next(model.parameters()).device
+    batch_size = window_batch_size or cfg.train.window_batch_size
     iterator = store.window_batches(
-        cfg.train.window_batch_size, cfg.proposal.window_size
+        batch_size,
+        model.cfg.window_size,
+        minimum_sequence_length=minimum_sequence_length,
     )
+    offsets_per_window: int | None = None
+    offset_generator: torch.Generator | None = None
+    if forecast_pairs_per_step is not None:
+        if forecast_pairs_per_step % batch_size:
+            raise ValueError("forecast_pairs_per_step must be divisible by batch size")
+        offsets_per_window = forecast_pairs_per_step // batch_size
+        if not 1 <= offsets_per_window < model.cfg.window_size:
+            raise ValueError("invalid number of forecast offsets per window")
+        offset_generator = torch.Generator(device=device).manual_seed(
+            cfg.train.seed + 3
+        )
     model.set_sae_trainable(False)
     optimizer = torch.optim.AdamW(
         [
@@ -349,7 +373,7 @@ def _train_proposal(
         fused=device.type == "cuda",
     )
     history: list[dict[str, float | int | str]] = []
-    for step in trange(1, cfg.train.branch_steps + 1, desc="transition JEPA"):
+    for step in trange(1, cfg.train.branch_steps + 1, desc=description):
         phase = (
             "predictor_warmup"
             if step <= cfg.proposal.predictor_warmup_steps
@@ -383,9 +407,23 @@ def _train_proposal(
                 joint_step / max(cfg.proposal.prediction_ramp_steps, 1),
             )
         windows = next(iterator).to(device, non_blocking=True)
+        offsets = None
+        if offsets_per_window is not None:
+            offsets = (
+                torch.randperm(
+                    model.cfg.window_size - 1,
+                    generator=offset_generator,
+                    device=device,
+                )[:offsets_per_window]
+                .sort()
+                .values
+                + 1
+            )
         optimizer.zero_grad(set_to_none=True)
         with _autocast(device, cfg.train.amp_dtype):
-            loss, metrics = _proposal_loss(model, windows, prediction_weight, cfg)
+            loss, metrics = _proposal_loss(
+                model, windows, prediction_weight, cfg, offsets
+            )
         loss.backward()
         if phase == "joint":
             _project_decoder_gradient(model.sae)
@@ -407,6 +445,17 @@ def _train_proposal(
                     "step": step,
                     "phase": phase,
                     "prediction_weight": prediction_weight,
+                    "window_size": model.cfg.window_size,
+                    "batch_windows": batch_size,
+                    "reconstruction_tokens": batch_size * model.cfg.window_size,
+                    "forecast_pairs": (
+                        batch_size
+                        * (
+                            offsets_per_window
+                            if offsets_per_window is not None
+                            else model.cfg.window_size - 1
+                        )
+                    ),
                     **metrics,
                 }
             )
@@ -529,3 +578,110 @@ def train_all(cfg: ExperimentConfig) -> dict[str, Path]:
         "temporal": temporal_path,
         "proposal": proposal_path,
     }
+
+
+def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
+    """Train only proposal variants, all from the saved shared SAE initialization."""
+    device = torch.device(cfg.train.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
+    _configure_accelerator(device)
+
+    manifest_path = Path(cfg.activation_dir) / "manifest.json"
+    _, manifest = load_manifest(manifest_path)
+    checkpoint_dir = Path(cfg.run_dir) / "checkpoints"
+    shared_path = checkpoint_dir / "shared_initialization.pt"
+    shared = load_checkpoint(shared_path)
+    if shared["activation_config_fingerprint"] != manifest["config_fingerprint"]:
+        raise ValueError(
+            "shared initialization and activation cache use different configurations"
+        )
+    sae_cfg = SparseAutoencoderConfig(**shared["model_config"])
+    base = SparseAutoencoder(sae_cfg)
+    base.load_state_dict(shared["state_dict"])
+
+    maximum_window = max(cfg.proposal.window_sizes)
+    torch.manual_seed(cfg.train.seed)
+    template_cfg = TransitionJEPAConfig(
+        d_in=sae_cfg.d_in,
+        d_sae=sae_cfg.d_sae,
+        k=sae_cfg.k,
+        window_size=maximum_window,
+        high_fraction=sae_cfg.high_fraction,
+        predictor_width=cfg.proposal.predictor_width,
+        predictor_expansion=cfg.proposal.predictor_expansion,
+        ema_decay=cfg.proposal.ema_decay,
+    )
+    template_state = TransitionJEPA(template_cfg, copy.deepcopy(base)).state_dict()
+    paths: dict[str, Path] = {}
+    histories: dict[str, Any] = {}
+    budgets: dict[str, Any] = {}
+    for window_size in cfg.proposal.window_sizes:
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(cfg.train.seed)
+        budget = cfg.proposal.sweep_budget(window_size)
+        proposal_cfg = TransitionJEPAConfig(
+            d_in=sae_cfg.d_in,
+            d_sae=sae_cfg.d_sae,
+            k=sae_cfg.k,
+            window_size=window_size,
+            high_fraction=sae_cfg.high_fraction,
+            predictor_width=cfg.proposal.predictor_width,
+            predictor_expansion=cfg.proposal.predictor_expansion,
+            ema_decay=cfg.proposal.ema_decay,
+        )
+        proposal = TransitionJEPA(proposal_cfg, copy.deepcopy(base))
+        proposal_state = proposal.state_dict()
+        for name, target in proposal_state.items():
+            source = template_state[name]
+            if source.shape == target.shape:
+                target.copy_(source)
+            elif name == "predictor.offset_embedding.weight":
+                target.copy_(source[:window_size])
+            else:
+                raise ValueError(f"cannot share sweep initialization for {name}")
+        proposal.load_state_dict(proposal_state)
+        proposal.to(device)
+        label = f"proposal_w{window_size:03d}"
+        histories[label] = _train_proposal(
+            proposal,
+            ActivationStore(manifest_path, cfg.train.seed + 100),
+            cfg,
+            window_batch_size=budget["batch_windows"],
+            forecast_pairs_per_step=budget["forecast_pairs_per_step"],
+            minimum_sequence_length=maximum_window,
+            description=f"transition JEPA W={window_size}",
+        )
+        budget_record = {
+            **budget,
+            "optimizer_steps": cfg.train.branch_steps,
+            "total_reconstruction_tokens": (
+                budget["reconstruction_tokens_per_step"]
+                * cfg.train.branch_steps
+            ),
+            "total_forecast_pairs": (
+                budget["forecast_pairs_per_step"] * cfg.train.branch_steps
+            ),
+            "minimum_sequence_length": maximum_window,
+        }
+        budgets[label] = budget_record
+        path = checkpoint_dir / f"{label}.pt"
+        _save_checkpoint(
+            path,
+            "proposal",
+            proposal,
+            asdict(proposal_cfg),
+            cfg,
+            manifest,
+            metadata={"window_sweep_budget": budget_record},
+        )
+        paths[label] = path
+        del proposal
+
+    run_dir = Path(cfg.run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "window_sweep_training_history.json").write_text(
+        json.dumps({"budgets": budgets, "histories": histories}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return paths

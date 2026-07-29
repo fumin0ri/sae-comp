@@ -167,13 +167,22 @@ class TransitionJEPA(nn.Module):
         normalized = (x - self.sae.pre_bias.detach()) / self.sae.pre_scale
         return token_topk(self.target_encoder(normalized), self.cfg.k)
 
-    def forward(self, windows: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self, windows: torch.Tensor, offsets: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
         if windows.ndim != 3 or windows.shape[1] != self.cfg.window_size:
             raise ValueError(f"expected [batch, {self.cfg.window_size}, d_in] windows")
+        if offsets is None:
+            offsets = torch.arange(1, self.cfg.window_size, device=windows.device)
+        if offsets.ndim != 1 or len(offsets) == 0:
+            raise ValueError("offsets must be a non-empty one-dimensional tensor")
+        offsets = offsets.to(device=windows.device, dtype=torch.long)
+        if int(offsets.min()) < 1 or int(offsets.max()) >= self.cfg.window_size:
+            raise ValueError("offsets must lie in [1, window_size)")
         codes = self.sae.encode_token_topk(windows)
         reconstruction = self.sae.decode(codes)
-        targets = self.target_codes(windows[:, 1:])
-        offsets = torch.arange(1, self.cfg.window_size, device=windows.device)
+        target_residual = windows[:, offsets]
+        targets = self.target_codes(target_residual)
         prediction, state = self.predictor(codes[:, 0], offsets)
         sparse_prediction = token_topk(prediction, self.cfg.k)
         return {
@@ -183,5 +192,7 @@ class TransitionJEPA(nn.Module):
             "prediction": prediction,
             "sparse_prediction": sparse_prediction,
             "predicted_residual": self.sae.decode(sparse_prediction),
+            "target_residual": target_residual,
+            "offsets": offsets,
             "state": state,
         }

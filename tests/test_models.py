@@ -53,3 +53,22 @@ def test_transition_jepa_shapes() -> None:
     assert output["targets"].shape == (4, 4, 24)
     assert output["reconstruction"].shape == (4, 5, 8)
     assert not output["targets"].requires_grad
+
+
+def test_transition_jepa_accepts_sampled_offsets() -> None:
+    sae_cfg = SparseAutoencoderConfig(d_in=8, d_sae=24, k=3)
+    model = TransitionJEPA(
+        TransitionJEPAConfig(
+            d_in=8,
+            d_sae=24,
+            k=3,
+            window_size=8,
+            predictor_width=10,
+        ),
+        SparseAutoencoder(sae_cfg),
+    )
+    output = model(torch.randn(4, 8, 8), torch.tensor([1, 3, 7]))
+    assert output["prediction"].shape == (4, 3, 24)
+    assert output["targets"].shape == (4, 3, 24)
+    assert output["target_residual"].shape == (4, 3, 8)
+    torch.testing.assert_close(output["offsets"], torch.tensor([1, 3, 7]))

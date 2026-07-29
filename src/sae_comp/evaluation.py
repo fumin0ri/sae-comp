@@ -205,7 +205,9 @@ def evaluate_method(
 
 @torch.inference_mode()
 def evaluate_proposal_forecast(
-    checkpoint_path: str | Path, cfg: ExperimentConfig
+    checkpoint_path: str | Path,
+    cfg: ExperimentConfig,
+    minimum_sequence_length: int | None = None,
 ) -> dict[str, Any]:
     device = torch.device(cfg.train.device)
     _, proposal, method = load_method(checkpoint_path, device)
@@ -220,13 +222,15 @@ def evaluate_proposal_forecast(
     for shard in store.validation_shards():
         activations = shard["activations"]
         lengths = shard["attention_mask"].sum(dim=1).tolist()
+        required_length = minimum_sequence_length or proposal.cfg.window_size
         windows = [
             activations[row, start : start + proposal.cfg.window_size]
             for row, length in enumerate(lengths)
+            if int(length) >= required_length
             for start in range(
                 0,
-                int(length) - proposal.cfg.window_size + 1,
-                proposal.cfg.window_size,
+                int(length) - required_length + 1,
+                required_length,
             )
         ]
         for start in range(0, len(windows), cfg.train.window_batch_size):
@@ -313,6 +317,110 @@ def evaluate_all(cfg: ExperimentConfig) -> dict[str, Any]:
                     "fraction_alive": values["fraction_alive"],
                     "l0": values["l0"],
                     **values["smoothness"]["full"],
+                }
+            )
+    return results
+
+
+def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
+    run_dir = Path(cfg.run_dir)
+    maximum_window = max(cfg.proposal.window_sizes)
+    common_horizon = min(cfg.proposal.window_sizes) - 1
+    results: dict[str, Any] = {}
+    for window_size in cfg.proposal.window_sizes:
+        label = f"proposal_w{window_size:03d}"
+        path = run_dir / "checkpoints" / f"{label}.pt"
+        budget = cfg.proposal.sweep_budget(window_size)
+        forecast = evaluate_proposal_forecast(
+            path,
+            cfg,
+            minimum_sequence_length=maximum_window,
+        )
+        common_offsets = forecast["offsets"][:common_horizon]
+        forecast["common_horizon_max_offset"] = common_horizon
+        forecast["common_horizon_mean_code_cosine"] = sum(
+            item["code_cosine"] for item in common_offsets
+        ) / len(common_offsets)
+        forecast["common_horizon_mean_true_minus_shuffled"] = sum(
+            item["true_minus_shuffled"] for item in common_offsets
+        ) / len(common_offsets)
+        results[label] = {
+            "window_size": window_size,
+            "training_budget": {
+                **budget,
+                "optimizer_steps": cfg.train.branch_steps,
+                "total_reconstruction_tokens": (
+                    budget["reconstruction_tokens_per_step"]
+                    * cfg.train.branch_steps
+                ),
+                "total_forecast_pairs": (
+                    budget["forecast_pairs_per_step"] * cfg.train.branch_steps
+                ),
+            },
+            "common": evaluate_method(path, cfg),
+            "forecast": forecast,
+        }
+
+    output_dir = run_dir / "evaluation"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "window_sweep.json").write_text(
+        json.dumps(results, indent=2) + "\n", encoding="utf-8"
+    )
+    with (output_dir / "window_sweep.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as stream:
+        fieldnames = [
+            "method",
+            "window_size",
+            "batch_windows",
+            "optimizer_steps",
+            "total_reconstruction_tokens",
+            "total_forecast_pairs",
+            "fve",
+            "cosine_similarity",
+            "fraction_alive",
+            "l0",
+            "lipschitz",
+            "fourier",
+            "wavelet",
+            "multiscale",
+            "common_horizon_forecast_code_cosine",
+            "common_horizon_forecast_true_minus_shuffled",
+            "all_offsets_forecast_code_cosine",
+            "all_offsets_forecast_true_minus_shuffled",
+        ]
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        for label, values in results.items():
+            common = values["common"]
+            budget = values["training_budget"]
+            writer.writerow(
+                {
+                    "method": label,
+                    "window_size": values["window_size"],
+                    "batch_windows": budget["batch_windows"],
+                    "optimizer_steps": budget["optimizer_steps"],
+                    "total_reconstruction_tokens": budget[
+                        "total_reconstruction_tokens"
+                    ],
+                    "total_forecast_pairs": budget["total_forecast_pairs"],
+                    "fve": common["fve"],
+                    "cosine_similarity": common["cosine_similarity"],
+                    "fraction_alive": common["fraction_alive"],
+                    "l0": common["l0"],
+                    **common["smoothness"]["full"],
+                    "common_horizon_forecast_code_cosine": values["forecast"][
+                        "common_horizon_mean_code_cosine"
+                    ],
+                    "common_horizon_forecast_true_minus_shuffled": values[
+                        "forecast"
+                    ]["common_horizon_mean_true_minus_shuffled"],
+                    "all_offsets_forecast_code_cosine": values["forecast"][
+                        "mean_code_cosine"
+                    ],
+                    "all_offsets_forecast_true_minus_shuffled": values[
+                        "forecast"
+                    ]["mean_true_minus_shuffled"],
                 }
             )
     return results

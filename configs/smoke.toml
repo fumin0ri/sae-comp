@@ -53,6 +53,9 @@ device = "cuda"
 
 [proposal]
 window_size = 10
+window_sizes = [8, 16, 32]
+sweep_tokens_per_step = 128
+sweep_forecast_pairs_per_step = 112
 predictor_width = 64
 predictor_expansion = 2
 predictor_warmup_steps = 5

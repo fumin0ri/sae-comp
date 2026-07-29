@@ -5,10 +5,14 @@ from collections.abc import Callable
 
 from .activations import extract_activations
 from .config import ExperimentConfig, load_config
-from .evaluation import evaluate_all
-from .probes import evaluate_probes, extract_mmlu_probe_cache
-from .report import build_report
-from .training import train_all
+from .evaluation import evaluate_all, evaluate_window_sweep
+from .probes import (
+    evaluate_probes,
+    evaluate_window_sweep_probes,
+    extract_mmlu_probe_cache,
+)
+from .report import build_report, build_window_sweep_report
+from .training import train_all, train_proposal_window_sweep
 
 
 Stage = tuple[str, Callable[[ExperimentConfig], object]]
@@ -18,6 +22,10 @@ STAGES: tuple[Stage, ...] = (
     ("evaluate", evaluate_all),
     ("probes", evaluate_probes),
     ("report", build_report),
+    ("train-window-sweep", train_proposal_window_sweep),
+    ("evaluate-window-sweep", evaluate_window_sweep),
+    ("probe-window-sweep", evaluate_window_sweep_probes),
+    ("report-window-sweep", build_window_sweep_report),
 )
 
 
@@ -26,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Compare standard, temporal, and transition-JEPA SAEs"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("extract", "train", "evaluate", "probes", "report"):
+    for command, _ in STAGES:
         child = subparsers.add_parser(command)
         child.add_argument("--config", required=True)
         if command in {"extract", "probes"}:
@@ -56,6 +64,14 @@ def main() -> None:
         print(evaluate_probes(cfg))
     elif args.command == "report":
         print(build_report(cfg))
+    elif args.command == "train-window-sweep":
+        print(train_proposal_window_sweep(cfg))
+    elif args.command == "evaluate-window-sweep":
+        print(evaluate_window_sweep(cfg))
+    elif args.command == "probe-window-sweep":
+        print(evaluate_window_sweep_probes(cfg))
+    elif args.command == "report-window-sweep":
+        print(build_window_sweep_report(cfg))
     elif args.command == "run":
         requested = [name.strip() for name in args.stages.split(",")]
         known = dict(STAGES)

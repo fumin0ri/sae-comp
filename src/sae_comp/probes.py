@@ -274,7 +274,11 @@ def _fit_probe(
 
 
 @torch.inference_mode()
-def evaluate_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
+def evaluate_probes(
+    cfg: ExperimentConfig,
+    checkpoint_paths: dict[str, Path] | None = None,
+    output_stem: str = "probes",
+) -> list[dict[str, Any]]:
     cache_path = extract_mmlu_probe_cache(cfg)
     cache = torch.load(cache_path, map_location="cpu", weights_only=True)
     activations = cache["activations"]
@@ -285,9 +289,14 @@ def evaluate_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
     }
     device = torch.device(cfg.train.device)
     run_dir = Path(cfg.run_dir)
+    if checkpoint_paths is None:
+        checkpoint_paths = {
+            name: run_dir / "checkpoints" / f"{name}.pt"
+            for name in ("standard", "temporal", "proposal")
+        }
     output_dir = run_dir / "evaluation"
     output_dir.mkdir(parents=True, exist_ok=True)
-    progress_path = output_dir / "probes_progress.json"
+    progress_path = output_dir / f"{output_stem}_progress.json"
     progress_data: dict[str, Any] = {}
     if progress_path.exists():
         progress_data = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -308,23 +317,25 @@ def evaluate_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
     if cfg.evaluation.probe_include_dense:
         sparsities = (*sparsities, None)
     jobs_per_split = len(label_sets) * len(sparsities)
-    total_jobs = jobs_per_split * 5
+    total_jobs = jobs_per_split * sum(
+        3 if label == "temporal" else 1 for label in checkpoint_paths
+    )
     progress = tqdm(
         total=total_jobs,
         initial=len(completed),
         desc="linear probes",
         unit="probe",
     )
-    for method in ("standard", "temporal", "proposal"):
-        sae, _, _ = load_method(run_dir / "checkpoints" / f"{method}.pt", device)
+    for label, checkpoint_path in checkpoint_paths.items():
+        sae, _, checkpoint_method = load_method(checkpoint_path, device)
         encoded_batches = []
         for start in range(0, len(activations), cfg.train.token_batch_size):
             batch = activations[start : start + cfg.train.token_batch_size].to(device)
-            encoded_batches.append(sae.encode(batch, method).cpu())
+            encoded_batches.append(sae.encode(batch, checkpoint_method).cpu())
         all_features = torch.cat(encoded_batches).float().numpy()
         high = sae.cfg.high_size
         splits = {"full": all_features}
-        if method == "temporal":
+        if checkpoint_method == "temporal":
             splits.update(
                 {
                     "high": all_features[:, :high],
@@ -352,7 +363,7 @@ def evaluate_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
                 )
                 for sparsity in sparsities:
                     display_sparsity = "dense" if sparsity is None else sparsity
-                    key = (method, split, task, str(display_sparsity))
+                    key = (label, split, task, str(display_sparsity))
                     if key in completed:
                         continue
                     selected_indices = (
@@ -361,7 +372,7 @@ def evaluate_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
                         else _select_ranked_features(rankings, sparsity)
                     )
                     progress.set_postfix_str(
-                        f"{method}/{split}/{task}/k={display_sparsity}"
+                        f"{label}/{split}/{task}/k={display_sparsity}"
                     )
                     accuracy, selected, iterations = _fit_probe(
                         task_features,
@@ -373,7 +384,7 @@ def evaluate_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
                         cfg.evaluation.probe_tolerance,
                     )
                     result = {
-                        "method": method,
+                        "method": label,
                         "split": split,
                         "task": task,
                         "sparsity": display_sparsity,
@@ -408,12 +419,31 @@ def evaluate_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
             str(item["sparsity"]),
         )
     )
-    (output_dir / "probes.json").write_text(
+    (output_dir / f"{output_stem}.json").write_text(
         json.dumps(results, indent=2) + "\n", encoding="utf-8"
     )
-    with (output_dir / "probes.csv").open("w", encoding="utf-8", newline="") as stream:
+    with (output_dir / f"{output_stem}.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as stream:
         writer = csv.DictWriter(stream, fieldnames=list(results[0]))
         writer.writeheader()
         writer.writerows(results)
     progress_path.unlink(missing_ok=True)
     return results
+
+
+def evaluate_window_sweep_probes(
+    cfg: ExperimentConfig,
+) -> list[dict[str, Any]]:
+    run_dir = Path(cfg.run_dir)
+    checkpoint_paths = {
+        f"proposal_w{window_size:03d}": (
+            run_dir / "checkpoints" / f"proposal_w{window_size:03d}.pt"
+        )
+        for window_size in cfg.proposal.window_sizes
+    }
+    return evaluate_probes(
+        cfg,
+        checkpoint_paths=checkpoint_paths,
+        output_stem="window_sweep_probes",
+    )

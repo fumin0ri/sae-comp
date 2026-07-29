@@ -1,8 +1,14 @@
 import torch
 
 from sae_comp.config import ExperimentConfig
-from sae_comp.models import SparseAutoencoder, SparseAutoencoderConfig
+from sae_comp.models import (
+    SparseAutoencoder,
+    SparseAutoencoderConfig,
+    TransitionJEPA,
+    TransitionJEPAConfig,
+)
 from sae_comp.training import (
+    _proposal_loss,
     _save_checkpoint,
     _symmetric_contrastive,
     _temporal_loss,
@@ -27,6 +33,30 @@ def test_temporal_loss_is_finite() -> None:
     assert threshold >= 0
     assert metrics["l0"] == 4
     assert active.shape == (40,)
+
+
+def test_proposal_loss_supports_budgeted_offsets() -> None:
+    cfg = ExperimentConfig()
+    sae = SparseAutoencoder(SparseAutoencoderConfig(d_in=12, d_sae=40, k=4))
+    proposal = TransitionJEPA(
+        TransitionJEPAConfig(
+            d_in=12,
+            d_sae=40,
+            k=4,
+            window_size=8,
+            predictor_width=16,
+        ),
+        sae,
+    )
+    loss, metrics = _proposal_loss(
+        proposal,
+        torch.randn(4, 8, 12),
+        prediction_weight=1.0,
+        cfg=cfg,
+        offsets=torch.tensor([1, 3, 7]),
+    )
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
 
 
 def test_checkpoint_round_trip(tmp_path) -> None:
