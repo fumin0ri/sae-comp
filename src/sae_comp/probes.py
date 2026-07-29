@@ -14,7 +14,7 @@ from sklearn.linear_model import SGDClassifier
 from tqdm import tqdm
 
 from .config import ExperimentConfig
-from .evaluation import load_method
+from .evaluation import controlled_checkpoint_paths, load_method
 
 
 def _load_spacy_model() -> Any:
@@ -446,4 +446,12 @@ def evaluate_window_sweep_probes(
         cfg,
         checkpoint_paths=checkpoint_paths,
         output_stem="window_sweep_probes",
+    )
+
+
+def evaluate_controlled_probes(cfg: ExperimentConfig) -> list[dict[str, Any]]:
+    return evaluate_probes(
+        cfg,
+        checkpoint_paths=controlled_checkpoint_paths(cfg),
+        output_stem="controlled_probes",
     )

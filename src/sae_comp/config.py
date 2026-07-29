@@ -53,6 +53,7 @@ class TrainConfig:
     standard_steps: int = 12_000
     branch_steps: int = 6_000
     token_batch_size: int = 512
+    temporal_pairs_per_step: int = 448
     window_batch_size: int = 32
     gradient_accumulation_steps: int = 1
     standard_lr: float = 2e-4
@@ -173,6 +174,10 @@ class ExperimentConfig:
             raise ValueError("sae.high_fraction must lie in (0, 1)")
         if self.train.standard_steps < 1 or self.train.branch_steps < 1:
             raise ValueError("training step counts must be positive")
+        if not 1 <= self.train.temporal_pairs_per_step <= self.train.token_batch_size:
+            raise ValueError(
+                "temporal_pairs_per_step must lie in [1, token_batch_size]"
+            )
         if not 0 <= self.proposal.predictor_warmup_steps < self.train.branch_steps:
             raise ValueError("predictor_warmup_steps must be smaller than branch_steps")
 

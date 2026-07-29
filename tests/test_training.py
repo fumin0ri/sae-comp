@@ -35,6 +35,20 @@ def test_temporal_loss_is_finite() -> None:
     assert active.shape == (40,)
 
 
+def test_temporal_loss_can_match_pair_budget() -> None:
+    cfg = ExperimentConfig()
+    sae = SparseAutoencoder(SparseAutoencoderConfig(d_in=12, d_sae=40, k=4))
+    loss, metrics, _, _ = _temporal_loss(
+        sae,
+        torch.randn(16, 12),
+        torch.randn(16, 12),
+        cfg,
+        contrastive_rows=8,
+    )
+    assert torch.isfinite(loss)
+    assert metrics["l0"] == 4
+
+
 def test_proposal_loss_supports_budgeted_offsets() -> None:
     cfg = ExperimentConfig()
     sae = SparseAutoencoder(SparseAutoencoderConfig(d_in=12, d_sae=40, k=4))

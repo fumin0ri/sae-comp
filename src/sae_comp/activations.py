@@ -290,14 +290,21 @@ class ActivationStore:
         return records
 
     def token_batches(
-        self, batch_size: int, split: str = "train"
+        self,
+        batch_size: int,
+        split: str = "train",
+        minimum_sequence_length: int | None = None,
     ) -> Iterator[torch.Tensor]:
         generator = torch.Generator().manual_seed(self.seed)
         epoch = 0
         while True:
             for record in self._records(split, epoch):
                 shard = load_shard(self.root, record)
-                values = shard["activations"][shard["attention_mask"]]
+                mask = shard["attention_mask"]
+                if minimum_sequence_length is not None:
+                    eligible = mask.sum(dim=1) >= minimum_sequence_length
+                    mask = mask & eligible[:, None]
+                values = shard["activations"][mask]
                 order = torch.randperm(len(values), generator=generator)
                 for start in range(0, len(order) - batch_size + 1, batch_size):
                     yield values.index_select(0, order[start : start + batch_size])
@@ -308,6 +315,7 @@ class ActivationStore:
         batch_size: int,
         mode: str = "previous",
         maximum_lookback: int = 24,
+        minimum_sequence_length: int | None = None,
     ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         generator = torch.Generator().manual_seed(self.seed + 1)
         epoch = 0
@@ -317,6 +325,9 @@ class ActivationStore:
                 activations = shard["activations"]
                 mask = shard["attention_mask"]
                 pair_mask = mask.clone()
+                if minimum_sequence_length is not None:
+                    eligible = mask.sum(dim=1) >= minimum_sequence_length
+                    pair_mask &= eligible[:, None]
                 pair_mask[:, 0] = False
                 rows, times = pair_mask.nonzero(as_tuple=True)
                 order = torch.randperm(len(rows), generator=generator)

@@ -5,14 +5,23 @@ from collections.abc import Callable
 
 from .activations import extract_activations
 from .config import ExperimentConfig, load_config
-from .evaluation import evaluate_all, evaluate_window_sweep
+from .evaluation import (
+    evaluate_all,
+    evaluate_controlled_comparison,
+    evaluate_window_sweep,
+)
 from .probes import (
+    evaluate_controlled_probes,
     evaluate_probes,
     evaluate_window_sweep_probes,
     extract_mmlu_probe_cache,
 )
-from .report import build_report, build_window_sweep_report
-from .training import train_all, train_proposal_window_sweep
+from .report import (
+    build_controlled_report,
+    build_report,
+    build_window_sweep_report,
+)
+from .training import train_all, train_controls, train_proposal_window_sweep
 
 
 Stage = tuple[str, Callable[[ExperimentConfig], object]]
@@ -26,6 +35,10 @@ STAGES: tuple[Stage, ...] = (
     ("evaluate-window-sweep", evaluate_window_sweep),
     ("probe-window-sweep", evaluate_window_sweep_probes),
     ("report-window-sweep", build_window_sweep_report),
+    ("train-controls", train_controls),
+    ("evaluate-controlled", evaluate_controlled_comparison),
+    ("probe-controlled", evaluate_controlled_probes),
+    ("report-controlled", build_controlled_report),
 )
 
 
@@ -72,6 +85,14 @@ def main() -> None:
         print(evaluate_window_sweep_probes(cfg))
     elif args.command == "report-window-sweep":
         print(build_window_sweep_report(cfg))
+    elif args.command == "train-controls":
+        print(train_controls(cfg))
+    elif args.command == "evaluate-controlled":
+        print(evaluate_controlled_comparison(cfg))
+    elif args.command == "probe-controlled":
+        print(evaluate_controlled_probes(cfg))
+    elif args.command == "report-controlled":
+        print(build_controlled_report(cfg))
     elif args.command == "run":
         requested = [name.strip() for name in args.stages.split(",")]
         known = dict(STAGES)

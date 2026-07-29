@@ -39,13 +39,13 @@ def test_controlled_sweep_has_equal_training_volume() -> None:
         cfg.proposal.sweep_budget(window_size)
         for window_size in cfg.proposal.window_sizes
     ]
-    assert [item["batch_windows"] for item in budgets] == [64, 32, 16, 8, 4]
+    assert cfg.proposal.window_sizes == [16, 32, 64]
+    assert [item["batch_windows"] for item in budgets] == [32, 16, 8]
     assert [item["forecast_offsets_per_window"] for item in budgets] == [
-        7,
         14,
         28,
         56,
-        112,
     ]
     assert {item["reconstruction_tokens_per_step"] for item in budgets} == {512}
     assert {item["forecast_pairs_per_step"] for item in budgets} == {448}
+    assert cfg.train.temporal_pairs_per_step == 448

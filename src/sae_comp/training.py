@@ -117,9 +117,13 @@ def _train_standard_phase(
     cfg: ExperimentConfig,
     steps: int,
     description: str,
+    minimum_sequence_length: int | None = None,
 ) -> list[dict[str, float | int]]:
     device = next(sae.parameters()).device
-    iterator = store.token_batches(cfg.train.token_batch_size)
+    iterator = store.token_batches(
+        cfg.train.token_batch_size,
+        minimum_sequence_length=minimum_sequence_length,
+    )
     optimizer = torch.optim.AdamW(
         sae.parameters(), lr=cfg.train.standard_lr, fused=device.type == "cuda"
     )
@@ -146,6 +150,10 @@ def _train_standard_phase(
                 {
                     "step": step,
                     "lr": lr,
+                    "reconstruction_tokens": (
+                        cfg.train.token_batch_size
+                        * cfg.train.gradient_accumulation_steps
+                    ),
                     **{
                         key: value / cfg.train.gradient_accumulation_steps
                         for key, value in metric_sums.items()
@@ -171,9 +179,13 @@ def _temporal_loss(
     previous: torch.Tensor,
     cfg: ExperimentConfig,
     dead_features: torch.Tensor | None = None,
+    contrastive_rows: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, float], torch.Tensor, torch.Tensor]:
     code, selected_minimum, post_relu = sae.encode_batch_topk(current)
-    previous_code, _, _ = sae.encode_batch_topk(previous)
+    pair_rows = contrastive_rows or len(current)
+    if not 1 <= pair_rows <= len(current):
+        raise ValueError("contrastive_rows must lie in [1, batch size]")
+    previous_code, _, _ = sae.encode_batch_topk(previous[:pair_rows])
     high = sae.cfg.high_size
     high_reconstruction = sae.pre_bias + sae.pre_scale * (
         code[:, :high] @ sae.decoder[:high]
@@ -182,7 +194,7 @@ def _temporal_loss(
     high_loss = _fvu(high_reconstruction, current)
     full_loss = _fvu(full_reconstruction, current)
     contrastive = _symmetric_contrastive(
-        code[:, :high],
+        code[:pair_rows, :high],
         previous_code[:, :high],
         cfg.sae.contrastive_temperature,
     )
@@ -235,9 +247,14 @@ def _train_temporal(
     sae: SparseAutoencoder,
     store: ActivationStore,
     cfg: ExperimentConfig,
+    *,
+    minimum_sequence_length: int | None = None,
 ) -> list[dict[str, float | int]]:
     device = next(sae.parameters()).device
-    iterator = store.temporal_pair_batches(cfg.train.token_batch_size)
+    iterator = store.temporal_pair_batches(
+        cfg.train.token_batch_size,
+        minimum_sequence_length=minimum_sequence_length,
+    )
     optimizer = torch.optim.Adam(
         sae.parameters(), lr=cfg.train.temporal_lr, betas=(0.9, 0.999)
     )
@@ -258,7 +275,12 @@ def _train_temporal(
         dead_features = tokens_since_fired >= cfg.sae.dead_token_threshold
         with _autocast(device, cfg.train.amp_dtype):
             loss, metrics, selected_minimum, active_features = _temporal_loss(
-                sae, current, previous, cfg, dead_features
+                sae,
+                current,
+                previous,
+                cfg,
+                dead_features,
+                contrastive_rows=cfg.train.temporal_pairs_per_step,
             )
         loss.backward()
         _project_decoder_gradient(sae)
@@ -285,6 +307,8 @@ def _train_temporal(
                     "step": step,
                     "lr": lr,
                     "threshold": float(sae.threshold),
+                    "reconstruction_tokens": len(current),
+                    "temporal_pairs": cfg.train.temporal_pairs_per_step,
                     **metrics,
                 }
             )
@@ -308,9 +332,7 @@ def _proposal_loss(
         dim=-1
     ) / target_energy
     prediction_loss = (1 - cosine + 0.25 * normalized_mse).mean()
-    residual_prediction = _fvu(
-        output["predicted_residual"], output["target_residual"]
-    )
+    residual_prediction = _fvu(output["predicted_residual"], output["target_residual"])
     state_std = output["state"].float().std(dim=0, unbiased=False)
     variance = F.relu(cfg.proposal.variance_target - state_std).mean()
     loss = (
@@ -460,6 +482,128 @@ def _train_proposal(
                 }
             )
     return history
+
+
+def train_controls(cfg: ExperimentConfig) -> dict[str, Path]:
+    """Train the shared initialization and the two non-proposal controls."""
+    device = torch.device(cfg.train.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is unavailable")
+    _configure_accelerator(device)
+    torch.manual_seed(cfg.train.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(cfg.train.seed)
+
+    manifest_path = Path(cfg.activation_dir) / "manifest.json"
+    _, manifest = load_manifest(manifest_path)
+    minimum_sequence_length = max(cfg.proposal.window_sizes)
+    sae_cfg = SparseAutoencoderConfig(
+        d_in=int(manifest["d_in"]),
+        d_sae=cfg.sae.dictionary_size,
+        k=cfg.sae.k,
+        high_fraction=cfg.sae.high_fraction,
+    )
+    base = SparseAutoencoder(sae_cfg).to(device)
+    base.initialize_normalization(
+        torch.tensor(manifest["normalization"]["mean"]),
+        float(manifest["normalization"]["scalar_rms"]),
+    )
+    run_dir = Path(cfg.run_dir)
+    checkpoint_dir = run_dir / "checkpoints"
+    history: dict[str, Any] = {
+        "comparison_budget": {
+            "minimum_sequence_length": minimum_sequence_length,
+            "branch_optimizer_steps": cfg.train.branch_steps,
+            "reconstruction_tokens_per_step": cfg.train.token_batch_size,
+            "temporal_pairs_per_step": cfg.train.temporal_pairs_per_step,
+            "total_reconstruction_tokens_per_method": (
+                cfg.train.token_batch_size * cfg.train.branch_steps
+            ),
+            "total_temporal_pairs_per_temporal_method": (
+                cfg.train.temporal_pairs_per_step * cfg.train.branch_steps
+            ),
+        }
+    }
+
+    history["shared_standard_pretraining"] = _train_standard_phase(
+        base,
+        ActivationStore(manifest_path, cfg.train.seed),
+        cfg,
+        cfg.train.standard_steps,
+        "shared standard SAE",
+        minimum_sequence_length=minimum_sequence_length,
+    )
+    shared_path = checkpoint_dir / "shared_initialization.pt"
+    _save_checkpoint(
+        shared_path,
+        "shared_initialization",
+        base,
+        base.checkpoint_config(),
+        cfg,
+        manifest,
+        metadata={"minimum_sequence_length": minimum_sequence_length},
+    )
+
+    standard = copy.deepcopy(base)
+    history["standard"] = _train_standard_phase(
+        standard,
+        ActivationStore(manifest_path, cfg.train.seed + 100),
+        cfg,
+        cfg.train.branch_steps,
+        "standard Top-K SAE control",
+        minimum_sequence_length=minimum_sequence_length,
+    )
+    standard_path = checkpoint_dir / "standard.pt"
+    _save_checkpoint(
+        standard_path,
+        "standard",
+        standard,
+        standard.checkpoint_config(),
+        cfg,
+        manifest,
+        metadata={
+            "comparison_budget": {
+                "optimizer_steps": cfg.train.branch_steps,
+                "reconstruction_tokens_per_step": cfg.train.token_batch_size,
+                "temporal_pairs_per_step": 0,
+            }
+        },
+    )
+    del standard
+
+    temporal = copy.deepcopy(base)
+    del base
+    history["temporal"] = _train_temporal(
+        temporal,
+        ActivationStore(manifest_path, cfg.train.seed + 100),
+        cfg,
+        minimum_sequence_length=minimum_sequence_length,
+    )
+    temporal_path = checkpoint_dir / "temporal.pt"
+    _save_checkpoint(
+        temporal_path,
+        "temporal",
+        temporal,
+        temporal.checkpoint_config(),
+        cfg,
+        manifest,
+        metadata={
+            "comparison_budget": {
+                "optimizer_steps": cfg.train.branch_steps,
+                "reconstruction_tokens_per_step": cfg.train.token_batch_size,
+                "temporal_pairs_per_step": cfg.train.temporal_pairs_per_step,
+            }
+        },
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "controlled_training_history.json").write_text(
+        json.dumps(history, indent=2) + "\n", encoding="utf-8"
+    )
+    return {
+        "shared": shared_path,
+        "standard": standard_path,
+        "temporal": temporal_path,
+    }
 
 
 def train_all(cfg: ExperimentConfig) -> dict[str, Path]:
@@ -656,8 +800,7 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
             **budget,
             "optimizer_steps": cfg.train.branch_steps,
             "total_reconstruction_tokens": (
-                budget["reconstruction_tokens_per_step"]
-                * cfg.train.branch_steps
+                budget["reconstruction_tokens_per_step"] * cfg.train.branch_steps
             ),
             "total_forecast_pairs": (
                 budget["forecast_pairs_per_step"] * cfg.train.branch_steps

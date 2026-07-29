@@ -122,6 +122,7 @@ def sequence_metrics(x: torch.Tensor, features: torch.Tensor) -> dict[str, float
 def evaluate_method(
     checkpoint_path: str | Path,
     cfg: ExperimentConfig,
+    minimum_sequence_length: int | None = None,
 ) -> dict[str, Any]:
     device = torch.device(cfg.train.device)
     sae, _, method = load_method(checkpoint_path, device)
@@ -156,7 +157,7 @@ def evaluate_method(
                 break
             mask = shard["attention_mask"][row]
             x = shard["activations"][row][mask].to(device)
-            if len(x) < 2:
+            if len(x) < (minimum_sequence_length or 2):
                 continue
             features = sae.encode(x, method)
             reconstruction = sae.decode(features)
@@ -322,6 +323,20 @@ def evaluate_all(cfg: ExperimentConfig) -> dict[str, Any]:
     return results
 
 
+def _summarize_common_forecast_horizon(
+    forecast: dict[str, Any], common_horizon: int
+) -> dict[str, Any]:
+    common_offsets = forecast["offsets"][:common_horizon]
+    forecast["common_horizon_max_offset"] = common_horizon
+    forecast["common_horizon_mean_code_cosine"] = sum(
+        item["code_cosine"] for item in common_offsets
+    ) / len(common_offsets)
+    forecast["common_horizon_mean_true_minus_shuffled"] = sum(
+        item["true_minus_shuffled"] for item in common_offsets
+    ) / len(common_offsets)
+    return forecast
+
+
 def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
     run_dir = Path(cfg.run_dir)
     maximum_window = max(cfg.proposal.window_sizes)
@@ -336,22 +351,14 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
             cfg,
             minimum_sequence_length=maximum_window,
         )
-        common_offsets = forecast["offsets"][:common_horizon]
-        forecast["common_horizon_max_offset"] = common_horizon
-        forecast["common_horizon_mean_code_cosine"] = sum(
-            item["code_cosine"] for item in common_offsets
-        ) / len(common_offsets)
-        forecast["common_horizon_mean_true_minus_shuffled"] = sum(
-            item["true_minus_shuffled"] for item in common_offsets
-        ) / len(common_offsets)
+        forecast = _summarize_common_forecast_horizon(forecast, common_horizon)
         results[label] = {
             "window_size": window_size,
             "training_budget": {
                 **budget,
                 "optimizer_steps": cfg.train.branch_steps,
                 "total_reconstruction_tokens": (
-                    budget["reconstruction_tokens_per_step"]
-                    * cfg.train.branch_steps
+                    budget["reconstruction_tokens_per_step"] * cfg.train.branch_steps
                 ),
                 "total_forecast_pairs": (
                     budget["forecast_pairs_per_step"] * cfg.train.branch_steps
@@ -412,15 +419,110 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
                     "common_horizon_forecast_code_cosine": values["forecast"][
                         "common_horizon_mean_code_cosine"
                     ],
-                    "common_horizon_forecast_true_minus_shuffled": values[
-                        "forecast"
-                    ]["common_horizon_mean_true_minus_shuffled"],
+                    "common_horizon_forecast_true_minus_shuffled": values["forecast"][
+                        "common_horizon_mean_true_minus_shuffled"
+                    ],
                     "all_offsets_forecast_code_cosine": values["forecast"][
                         "mean_code_cosine"
                     ],
-                    "all_offsets_forecast_true_minus_shuffled": values[
-                        "forecast"
-                    ]["mean_true_minus_shuffled"],
+                    "all_offsets_forecast_true_minus_shuffled": values["forecast"][
+                        "mean_true_minus_shuffled"
+                    ],
+                }
+            )
+    return results
+
+
+def controlled_checkpoint_paths(cfg: ExperimentConfig) -> dict[str, Path]:
+    checkpoint_dir = Path(cfg.run_dir) / "checkpoints"
+    paths = {
+        "standard": checkpoint_dir / "standard.pt",
+        "temporal": checkpoint_dir / "temporal.pt",
+    }
+    paths.update(
+        {
+            f"proposal_w{window_size:03d}": (
+                checkpoint_dir / f"proposal_w{window_size:03d}.pt"
+            )
+            for window_size in cfg.proposal.window_sizes
+        }
+    )
+    return paths
+
+
+def evaluate_controlled_comparison(cfg: ExperimentConfig) -> dict[str, Any]:
+    minimum_sequence_length = max(cfg.proposal.window_sizes)
+    common_horizon = min(cfg.proposal.window_sizes) - 1
+    checkpoints = controlled_checkpoint_paths(cfg)
+    methods = {
+        label: evaluate_method(
+            path,
+            cfg,
+            minimum_sequence_length=minimum_sequence_length,
+        )
+        for label, path in checkpoints.items()
+    }
+    forecasts = {}
+    for window_size in cfg.proposal.window_sizes:
+        label = f"proposal_w{window_size:03d}"
+        forecast = evaluate_proposal_forecast(
+            checkpoints[label],
+            cfg,
+            minimum_sequence_length=minimum_sequence_length,
+        )
+        forecasts[label] = _summarize_common_forecast_horizon(forecast, common_horizon)
+    results = {
+        "experiment": {
+            "model": cfg.model.name,
+            "revision": cfg.model.revision,
+            "layer": cfg.model.layer,
+            "dictionary_size": cfg.sae.dictionary_size,
+            "k": cfg.sae.k,
+            "seed": cfg.train.seed,
+            "minimum_sequence_length": minimum_sequence_length,
+            "branch_optimizer_steps": cfg.train.branch_steps,
+            "reconstruction_tokens_per_step": cfg.train.token_batch_size,
+            "temporal_pairs_per_step": cfg.train.temporal_pairs_per_step,
+            "total_reconstruction_tokens_per_method": (
+                cfg.train.token_batch_size * cfg.train.branch_steps
+            ),
+            "total_temporal_pairs_per_temporal_method": (
+                cfg.train.temporal_pairs_per_step * cfg.train.branch_steps
+            ),
+        },
+        "methods": methods,
+        "proposal_forecasts": forecasts,
+    }
+    output_dir = Path(cfg.run_dir) / "evaluation"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "controlled_metrics.json").write_text(
+        json.dumps(results, indent=2) + "\n", encoding="utf-8"
+    )
+    with (output_dir / "controlled_metrics.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as stream:
+        fieldnames = [
+            "method",
+            "fve",
+            "cosine_similarity",
+            "fraction_alive",
+            "l0",
+            "lipschitz",
+            "fourier",
+            "wavelet",
+            "multiscale",
+        ]
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        for label, values in methods.items():
+            writer.writerow(
+                {
+                    "method": label,
+                    "fve": values["fve"],
+                    "cosine_similarity": values["cosine_similarity"],
+                    "fraction_alive": values["fraction_alive"],
+                    "l0": values["l0"],
+                    **values["smoothness"]["full"],
                 }
             )
     return results
