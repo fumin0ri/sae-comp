@@ -57,3 +57,7 @@ token-wise Top-K を使用します。
 checkpoint path、stage status を記録します。`report-saebench` は公式 JSON を読み、
 `summary.json`、`summary.csv`、総合ダッシュボードと3種類の詳細グラフ、
 `SAEBENCH_REPORT.md` を生成します。
+
+評価途中でも `report-saebench` を実行できます。存在する公式 JSON だけを集計し、
+評価ごとの完了条件数と不足条件をレポートに表示します。総合ダッシュボードは
+4評価×5条件がすべて揃った時点で生成されます。

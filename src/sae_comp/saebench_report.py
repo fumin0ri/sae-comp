@@ -16,12 +16,16 @@ from .plots import COLORS, display_name
 from .saebench import CUSTOM_SAE_ID
 
 
-def _load_eval_result(root: Path, eval_type: str, label: str) -> dict[str, Any]:
-    path = root / eval_type / f"{label}_{CUSTOM_SAE_ID}_eval_results.json"
+def _result_path(root: Path, eval_type: str, label: str) -> Path:
+    return root / eval_type / f"{label}_{CUSTOM_SAE_ID}_eval_results.json"
+
+
+def _load_eval_result(
+    root: Path, eval_type: str, label: str
+) -> dict[str, Any] | None:
+    path = _result_path(root, eval_type, label)
     if not path.is_file():
-        raise FileNotFoundError(
-            f"missing SAEBench result for {eval_type}/{label}: {path}"
-        )
+        return None
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -38,48 +42,76 @@ def collect_saebench_summary(cfg: ExperimentConfig) -> dict[str, Any]:
         "eval_types": list(cfg.sae_bench.eval_types),
         "excluded_eval_types": list(cfg.sae_bench.excluded_eval_types),
         "conditions": {},
+        "availability": {
+            eval_type: {label: False for label in labels}
+            for eval_type in cfg.sae_bench.eval_types
+        },
     }
     for label in labels:
         condition: dict[str, Any] = {}
         if "core" in cfg.sae_bench.eval_types:
             result = _load_eval_result(root, "core", label)
-            metrics = result["eval_result_metrics"]
-            condition["core"] = {
-                "explained_variance": metrics["reconstruction_quality"][
-                    "explained_variance"
-                ],
-                "mse": metrics["reconstruction_quality"]["mse"],
-                "ce_loss_score": metrics["model_performance_preservation"][
-                    "ce_loss_score"
-                ],
-                "l0": metrics["sparsity"]["l0"],
-            }
+            if result is not None:
+                summary["availability"]["core"][label] = True
+                metrics = result["eval_result_metrics"]
+                condition["core"] = {
+                    "explained_variance": metrics["reconstruction_quality"][
+                        "explained_variance"
+                    ],
+                    "mse": metrics["reconstruction_quality"]["mse"],
+                    "ce_loss_score": metrics["model_performance_preservation"][
+                        "ce_loss_score"
+                    ],
+                    "l0": metrics["sparsity"]["l0"],
+                }
         if "sparse_probing" in cfg.sae_bench.eval_types:
             result = _load_eval_result(root, "sparse_probing", label)
-            metrics = result["eval_result_metrics"]["sae"]
-            condition["sparse_probing"] = {
-                f"top_{k}_accuracy": metrics[f"sae_top_{k}_test_accuracy"]
-                for k in (1, 2, 5)
-            }
+            if result is not None:
+                summary["availability"]["sparse_probing"][label] = True
+                metrics = result["eval_result_metrics"]["sae"]
+                condition["sparse_probing"] = {
+                    f"top_{k}_accuracy": metrics[f"sae_top_{k}_test_accuracy"]
+                    for k in (1, 2, 5)
+                }
         if "sparse_probing_sae_probes" in cfg.sae_bench.eval_types:
             result = _load_eval_result(
                 root, "sparse_probing_sae_probes", label
             )
-            metrics = result["eval_result_metrics"]["sae"]
-            condition["sparse_probing_sae_probes"] = {
-                f"top_{k}_accuracy": metrics[f"sae_top_{k}_test_accuracy"]
-                for k in (1, 2, 5)
-            }
+            if result is not None:
+                summary["availability"]["sparse_probing_sae_probes"][label] = True
+                metrics = result["eval_result_metrics"]["sae"]
+                condition["sparse_probing_sae_probes"] = {
+                    f"top_{k}_accuracy": metrics[f"sae_top_{k}_test_accuracy"]
+                    for k in (1, 2, 5)
+                }
         if "ravel" in cfg.sae_bench.eval_types:
             result = _load_eval_result(root, "ravel", label)
-            metrics = result["eval_result_metrics"]["ravel"]
-            condition["ravel"] = {
-                "disentanglement_score": metrics["disentanglement_score"],
-                "cause_score": metrics["cause_score"],
-                "isolation_score": metrics["isolation_score"],
-            }
+            if result is not None:
+                summary["availability"]["ravel"][label] = True
+                metrics = result["eval_result_metrics"]["ravel"]
+                condition["ravel"] = {
+                    "disentanglement_score": metrics["disentanglement_score"],
+                    "cause_score": metrics["cause_score"],
+                    "isolation_score": metrics["isolation_score"],
+                }
         summary["conditions"][label] = condition
 
+    summary["completed_eval_types"] = [
+        eval_type
+        for eval_type, availability in summary["availability"].items()
+        if all(availability.values())
+    ]
+    summary["available_eval_types"] = [
+        eval_type
+        for eval_type, availability in summary["availability"].items()
+        if any(availability.values())
+    ]
+    summary["missing_results"] = [
+        str(_result_path(root, eval_type, label))
+        for eval_type, availability in summary["availability"].items()
+        for label, available in availability.items()
+        if not available
+    ]
     root.mkdir(parents=True, exist_ok=True)
     (root / "summary.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
@@ -348,24 +380,26 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
     run_dir = Path(cfg.run_dir)
     output_dir = run_dir / "saebench_results" / "plots"
     plots: list[Path] = []
+    completed_eval_types = set(summary["completed_eval_types"])
+    available_eval_types = set(summary["available_eval_types"])
     complete_overview = {
         "core",
         "sparse_probing",
         "sparse_probing_sae_probes",
         "ravel",
-    }.issubset(cfg.sae_bench.eval_types)
+    }.issubset(completed_eval_types)
     overview_path: Path | None = None
     if complete_overview:
         overview_path = _plot_overview(summary, output_dir, cfg.sae.k)
         plots.append(overview_path)
-    if "core" in cfg.sae_bench.eval_types:
+    if "core" in completed_eval_types:
         plots.append(_plot_core(summary, output_dir))
     if {
         "sparse_probing",
         "sparse_probing_sae_probes",
-    }.issubset(cfg.sae_bench.eval_types):
+    }.issubset(completed_eval_types):
         plots.append(_plot_probing(summary, output_dir))
-    if "ravel" in cfg.sae_bench.eval_types:
+    if "ravel" in completed_eval_types:
         plots.append(_plot_ravel(summary, output_dir))
 
     lines = [
@@ -393,6 +427,40 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
         ),
         "",
     ]
+    lines.extend(
+        [
+            "## Evaluation completion",
+            "",
+            "| Evaluation | Completed conditions | Missing conditions |",
+            "|---|---:|---|",
+        ]
+    )
+    for eval_type in cfg.sae_bench.eval_types:
+        availability = summary["availability"][eval_type]
+        completed = sum(availability.values())
+        missing = [
+            display_name(label)
+            for label, available in availability.items()
+            if not available
+        ]
+        lines.append(
+            f"| `{eval_type}` | {completed}/{len(availability)} | "
+            f"{', '.join(missing) if missing else '-'} |"
+        )
+    lines.append("")
+    if summary["missing_results"]:
+        lines.extend(
+            [
+                (
+                    "> **Partial report:** some SAEBench evaluations have not completed. "
+                    "The tables and figures below use only available official result "
+                    "files. Resume with "
+                    "`sae-comp saebench --config configs/controlled_rtx4090.toml`, "
+                    "then regenerate this report."
+                ),
+                "",
+            ]
+        )
     if overview_path is not None:
         relative = overview_path.relative_to(run_dir).as_posix()
         lines.extend(
@@ -422,7 +490,7 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
         )
     conditions = summary["conditions"]
     labels = list(conditions)
-    if "core" in cfg.sae_bench.eval_types:
+    if "core" in available_eval_types:
         lines.extend(
             [
                 "## Core",
@@ -432,20 +500,20 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
             ]
         )
         for label in labels:
-            values = conditions[label]["core"]
+            values = conditions[label].get("core", {})
             lines.append(
                 f"| {display_name(label)} | "
-                f"{_number(values['explained_variance'])} | "
-                f"{_number(values['mse'])} | "
-                f"{_number(values['ce_loss_score'])} | "
-                f"{_number(values['l0'])} |"
+                f"{_number(values.get('explained_variance'))} | "
+                f"{_number(values.get('mse'))} | "
+                f"{_number(values.get('ce_loss_score'))} | "
+                f"{_number(values.get('l0'))} |"
             )
         lines.append("")
     for section, title in (
         ("sparse_probing", "Sparse probing"),
         ("sparse_probing_sae_probes", "Sparse probing with SAE-Probes"),
     ):
-        if section not in cfg.sae_bench.eval_types:
+        if section not in available_eval_types:
             continue
         lines.extend(
             [
@@ -456,15 +524,15 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
             ]
         )
         for label in labels:
-            values = conditions[label][section]
+            values = conditions[label].get(section, {})
             lines.append(
                 f"| {display_name(label)} | "
-                f"{_number(values['top_1_accuracy'])} | "
-                f"{_number(values['top_2_accuracy'])} | "
-                f"{_number(values['top_5_accuracy'])} |"
+                f"{_number(values.get('top_1_accuracy'))} | "
+                f"{_number(values.get('top_2_accuracy'))} | "
+                f"{_number(values.get('top_5_accuracy'))} |"
             )
         lines.append("")
-    if "ravel" in cfg.sae_bench.eval_types:
+    if "ravel" in available_eval_types:
         lines.extend(
             [
                 "## RAVEL",
@@ -474,27 +542,27 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
             ]
         )
         for label in labels:
-            values = conditions[label]["ravel"]
+            values = conditions[label].get("ravel", {})
             lines.append(
                 f"| {display_name(label)} | "
-                f"{_number(values['disentanglement_score'])} | "
-                f"{_number(values['cause_score'])} | "
-                f"{_number(values['isolation_score'])} |"
+                f"{_number(values.get('disentanglement_score'))} | "
+                f"{_number(values.get('cause_score'))} | "
+                f"{_number(values.get('isolation_score'))} |"
             )
         lines.append("")
-    lines.extend(["## Detailed figures", ""])
-    for plot in plots:
-        if plot == overview_path:
-            continue
-        relative = plot.relative_to(run_dir).as_posix()
-        lines.extend(
-            [
-                f"### {plot.stem.replace('_', ' ').title()}",
-                "",
-                f"![{plot.stem}]({relative})",
-                "",
-            ]
-        )
+    detail_plots = [plot for plot in plots if plot != overview_path]
+    if detail_plots:
+        lines.extend(["## Detailed figures", ""])
+        for plot in detail_plots:
+            relative = plot.relative_to(run_dir).as_posix()
+            lines.extend(
+                [
+                    f"### {plot.stem.replace('_', ' ').title()}",
+                    "",
+                    f"![{plot.stem}]({relative})",
+                    "",
+                ]
+            )
     lines.extend(
         [
             (

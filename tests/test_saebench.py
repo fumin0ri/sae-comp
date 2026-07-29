@@ -138,3 +138,49 @@ def test_saebench_summary_reads_official_result_shape(tmp_path: Path) -> None:
     assert (root / "plots" / "core.png").is_file()
     assert (root / "plots" / "probing.png").is_file()
     assert (root / "plots" / "ravel.png").is_file()
+
+
+def test_partial_saebench_report_uses_available_results(tmp_path: Path) -> None:
+    cfg = replace(
+        load_config(ROOT / "configs" / "controlled_rtx4090.toml"),
+        run_dir=str(tmp_path),
+    )
+    root = tmp_path / "saebench_results"
+    output_dir = root / "core"
+    output_dir.mkdir(parents=True)
+    core_metrics = {
+        "reconstruction_quality": {"explained_variance": 0.8, "mse": 0.2},
+        "model_performance_preservation": {"ce_loss_score": 0.9},
+        "sparsity": {"l0": 20.0},
+    }
+    labels = ["standard", "temporal", "proposal_w016", "proposal_w032", "proposal_w064"]
+    for label in labels:
+        (output_dir / f"{label}_custom_sae_eval_results.json").write_text(
+            json.dumps({"eval_result_metrics": core_metrics}), encoding="utf-8"
+        )
+
+    report = build_saebench_report(cfg)
+    summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+    report_text = report.read_text(encoding="utf-8")
+    assert summary["completed_eval_types"] == ["core"]
+    assert len(summary["missing_results"]) == 15
+    assert "**Partial report:**" in report_text
+    assert "| `core` | 5/5 | - |" in report_text
+    assert "| `sparse_probing` | 0/5 |" in report_text
+    assert (root / "plots" / "core.png").is_file()
+    assert not (root / "plots" / "overview.png").exists()
+
+
+def test_saebench_report_without_results_explains_how_to_resume(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(
+        load_config(ROOT / "configs" / "controlled_rtx4090.toml"),
+        run_dir=str(tmp_path),
+    )
+    report = build_saebench_report(cfg)
+    report_text = report.read_text(encoding="utf-8")
+    assert "**Partial report:**" in report_text
+    assert "sae-comp saebench --config" in report_text
+    assert "| `core` | 0/5 |" in report_text
+    assert not (tmp_path / "saebench_results" / "plots").exists()
