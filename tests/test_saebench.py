@@ -134,6 +134,7 @@ def test_saebench_summary_reads_official_result_shape(tmp_path: Path) -> None:
     assert (root / "summary.csv").is_file()
     report = build_saebench_report(cfg)
     assert report.is_file()
+    assert (root / "plots" / "overview.png").is_file()
     assert (root / "plots" / "core.png").is_file()
     assert (root / "plots" / "probing.png").is_file()
     assert (root / "plots" / "ravel.png").is_file()

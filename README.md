@@ -105,11 +105,18 @@ runs/saebench-pythia160m-deduped/
     sparse_probing_sae_probes/
     ravel/
     plots/
+      overview.png
+      core.png
+      probing.png
+      ravel.png
     manifest.json
     summary.json
     summary.csv
   SAEBENCH_REPORT.md
 ```
+
+`SAEBENCH_REPORT.md` には総合ダッシュボード、指標ごとの最高点条件、全数値表、
+詳細グラフが自動的にまとめられます。
 
 詳細は [SAEBench 実行仕様](docs/SAEBENCH.md) と
 [window sweep](docs/WINDOW_SWEEP.md) を参照してください。

@@ -122,6 +122,117 @@ def _save_figure(figure: plt.Figure, path: Path) -> Path:
     return path
 
 
+def _grouped_bars(
+    axis: plt.Axes,
+    summary: dict[str, Any],
+    metrics: tuple[tuple[str, str, str], ...],
+) -> None:
+    labels = list(summary["conditions"])
+    width = 0.8 / len(labels)
+    x_values = list(range(len(metrics)))
+    for index, label in enumerate(labels):
+        positions = [x - 0.4 + width / 2 + index * width for x in x_values]
+        values = [
+            summary["conditions"][label][section][metric]
+            for section, metric, _ in metrics
+        ]
+        axis.bar(
+            positions,
+            values,
+            width=width,
+            color=COLORS.get(label, "#777777"),
+            label=display_name(label),
+        )
+    axis.set_xticks(x_values, [title for _, _, title in metrics])
+    axis.grid(axis="y", alpha=0.25)
+
+
+def _plot_overview(summary: dict[str, Any], output_dir: Path, target_l0: int) -> Path:
+    labels = list(summary["conditions"])
+    figure, axes = plt.subplots(2, 2, figsize=(16, 11), constrained_layout=True)
+    figure.suptitle(
+        "SAEBench controlled comparison overview",
+        fontsize=18,
+        fontweight="bold",
+    )
+
+    _grouped_bars(
+        axes[0, 0],
+        summary,
+        (
+            ("core", "explained_variance", "Explained\nvariance"),
+            ("core", "ce_loss_score", "CE loss\nscore"),
+        ),
+    )
+    axes[0, 0].set_title("Reconstruction and model preservation")
+    axes[0, 0].set_ylabel("Score (higher is better)")
+    axes[0, 0].set_ylim(0, 1.02)
+
+    _grouped_bars(
+        axes[0, 1],
+        summary,
+        (
+            ("sparse_probing", "top_5_accuracy", "Sparse probing"),
+            (
+                "sparse_probing_sae_probes",
+                "top_5_accuracy",
+                "SAE-Probes",
+            ),
+        ),
+    )
+    axes[0, 1].set_title("Top-5 sparse feature probing")
+    axes[0, 1].set_ylabel("Accuracy (higher is better)")
+    axes[0, 1].set_ylim(0, 1.02)
+
+    _grouped_bars(
+        axes[1, 0],
+        summary,
+        (
+            ("ravel", "disentanglement_score", "Disentangle"),
+            ("ravel", "cause_score", "Cause"),
+            ("ravel", "isolation_score", "Isolation"),
+        ),
+    )
+    axes[1, 0].set_title("RAVEL intervention metrics")
+    axes[1, 0].set_ylabel("Score (higher is better)")
+    axes[1, 0].set_ylim(0, 1.02)
+
+    l0_values = [summary["conditions"][label]["core"]["l0"] for label in labels]
+    bars = axes[1, 1].bar(
+        range(len(labels)),
+        l0_values,
+        color=[COLORS.get(label, "#777777") for label in labels],
+    )
+    axes[1, 1].axhline(
+        target_l0,
+        color="#222222",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"Training target k={target_l0}",
+    )
+    axes[1, 1].set_title("Observed sparsity sanity check")
+    axes[1, 1].set_ylabel("Mean active features (L0)")
+    axes[1, 1].set_xticks(
+        range(len(labels)),
+        [display_name(label) for label in labels],
+        rotation=25,
+        ha="right",
+    )
+    axes[1, 1].grid(axis="y", alpha=0.25)
+    axes[1, 1].bar_label(bars, fmt="%.2f", padding=3, fontsize=8)
+    axes[1, 1].legend(fontsize=8)
+
+    handles, legend_labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(
+        handles,
+        legend_labels,
+        loc="outside lower center",
+        ncol=len(labels),
+        fontsize=9,
+    )
+    return _save_figure(figure, output_dir / "overview.png")
+
+
 def _plot_core(summary: dict[str, Any], output_dir: Path) -> Path:
     labels = list(summary["conditions"])
     metrics = (
@@ -183,31 +294,14 @@ def _plot_probing(summary: dict[str, Any], output_dir: Path) -> Path:
 
 
 def _plot_ravel(summary: dict[str, Any], output_dir: Path) -> Path:
-    labels = list(summary["conditions"])
     metrics = (
-        ("disentanglement_score", "Disentanglement"),
-        ("cause_score", "Cause"),
-        ("isolation_score", "Isolation"),
+        ("ravel", "disentanglement_score", "Disentanglement"),
+        ("ravel", "cause_score", "Cause"),
+        ("ravel", "isolation_score", "Isolation"),
     )
-    width = 0.8 / len(labels)
-    x_values = list(range(len(metrics)))
     figure, axis = plt.subplots(figsize=(11, 6), constrained_layout=True)
-    for index, label in enumerate(labels):
-        positions = [
-            x - 0.4 + width / 2 + index * width for x in x_values
-        ]
-        values = [
-            summary["conditions"][label]["ravel"][key] for key, _ in metrics
-        ]
-        axis.bar(
-            positions,
-            values,
-            width=width,
-            color=COLORS.get(label, "#777777"),
-            label=display_name(label),
-        )
+    _grouped_bars(axis, summary, metrics)
     axis.set_title("SAEBench RAVEL (higher is better)", fontsize=16, fontweight="bold")
-    axis.set_xticks(x_values, [title for _, title in metrics])
     axis.set_ylabel("Score")
     axis.set_ylim(0, 1.02)
     axis.grid(axis="y", alpha=0.25)
@@ -215,11 +309,55 @@ def _plot_ravel(summary: dict[str, Any], output_dir: Path) -> Path:
     return _save_figure(figure, output_dir / "ravel.png")
 
 
+def _point_estimate_rows(summary: dict[str, Any]) -> list[tuple[str, str, float]]:
+    metrics = (
+        ("Explained variance", "core", "explained_variance", True),
+        ("Reconstruction MSE", "core", "mse", False),
+        ("CE loss score", "core", "ce_loss_score", True),
+        ("Sparse probing Top-5", "sparse_probing", "top_5_accuracy", True),
+        (
+            "SAE-Probes Top-5",
+            "sparse_probing_sae_probes",
+            "top_5_accuracy",
+            True,
+        ),
+        ("RAVEL disentanglement", "ravel", "disentanglement_score", True),
+        ("RAVEL cause", "ravel", "cause_score", True),
+        ("RAVEL isolation", "ravel", "isolation_score", True),
+    )
+    rows: list[tuple[str, str, float]] = []
+    for title, section, metric, higher_is_better in metrics:
+        values = {
+            label: condition[section][metric]
+            for label, condition in summary["conditions"].items()
+        }
+        best_value = (
+            max(values.values()) if higher_is_better else min(values.values())
+        )
+        best_labels = [
+            display_name(label)
+            for label, value in values.items()
+            if abs(value - best_value) <= 1e-12
+        ]
+        rows.append((title, ", ".join(best_labels), best_value))
+    return rows
+
+
 def build_saebench_report(cfg: ExperimentConfig) -> Path:
     summary = collect_saebench_summary(cfg)
     run_dir = Path(cfg.run_dir)
     output_dir = run_dir / "saebench_results" / "plots"
     plots: list[Path] = []
+    complete_overview = {
+        "core",
+        "sparse_probing",
+        "sparse_probing_sae_probes",
+        "ravel",
+    }.issubset(cfg.sae_bench.eval_types)
+    overview_path: Path | None = None
+    if complete_overview:
+        overview_path = _plot_overview(summary, output_dir, cfg.sae.k)
+        plots.append(overview_path)
     if "core" in cfg.sae_bench.eval_types:
         plots.append(_plot_core(summary, output_dir))
     if {
@@ -255,6 +393,33 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
         ),
         "",
     ]
+    if overview_path is not None:
+        relative = overview_path.relative_to(run_dir).as_posix()
+        lines.extend(
+            [
+                "## Overview",
+                "",
+                f"![SAEBench comparison overview]({relative})",
+                "",
+                "### Best point estimates",
+                "",
+                "| Metric | Best condition | Value |",
+                "|---|---|---:|",
+            ]
+        )
+        for metric, label, value in _point_estimate_rows(summary):
+            lines.append(f"| {metric} | {label} | {_number(value)} |")
+        lines.extend(
+            [
+                "",
+                (
+                    "These are descriptive point estimates, not "
+                    "statistical-significance claims. L0 is shown as a sparsity "
+                    "sanity check and is not ranked."
+                ),
+                "",
+            ]
+        )
     conditions = summary["conditions"]
     labels = list(conditions)
     if "core" in cfg.sae_bench.eval_types:
@@ -317,8 +482,10 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
                 f"{_number(values['isolation_score'])} |"
             )
         lines.append("")
-    lines.extend(["## Figures", ""])
+    lines.extend(["## Detailed figures", ""])
     for plot in plots:
+        if plot == overview_path:
+            continue
         relative = plot.relative_to(run_dir).as_posix()
         lines.extend(
             [

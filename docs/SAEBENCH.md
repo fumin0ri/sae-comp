@@ -55,4 +55,5 @@ token-wise Top-K を使用します。
 
 `saebench_results/manifest.json` には version、model、hook、実行対象、除外対象、
 checkpoint path、stage status を記録します。`report-saebench` は公式 JSON を読み、
-`summary.json`、`summary.csv`、3種類のグラフ、`SAEBENCH_REPORT.md` を生成します。
+`summary.json`、`summary.csv`、総合ダッシュボードと3種類の詳細グラフ、
+`SAEBENCH_REPORT.md` を生成します。
