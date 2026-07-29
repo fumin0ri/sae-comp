@@ -21,8 +21,9 @@ from .report import (
     build_report,
     build_window_sweep_report,
 )
+from .saebench import run_saebench
+from .saebench_report import build_saebench_report
 from .training import train_all, train_controls, train_proposal_window_sweep
-
 
 Stage = tuple[str, Callable[[ExperimentConfig], object]]
 STAGES: tuple[Stage, ...] = (
@@ -39,6 +40,8 @@ STAGES: tuple[Stage, ...] = (
     ("evaluate-controlled", evaluate_controlled_comparison),
     ("probe-controlled", evaluate_controlled_probes),
     ("report-controlled", build_controlled_report),
+    ("saebench", run_saebench),
+    ("report-saebench", build_saebench_report),
 )
 
 
@@ -93,6 +96,10 @@ def main() -> None:
         print(evaluate_controlled_probes(cfg))
     elif args.command == "report-controlled":
         print(build_controlled_report(cfg))
+    elif args.command == "saebench":
+        print(run_saebench(cfg))
+    elif args.command == "report-saebench":
+        print(build_saebench_report(cfg))
     elif args.command == "run":
         requested = [name.strip() for name in args.stages.split(",")]
         known = dict(STAGES)

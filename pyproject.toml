@@ -26,6 +26,9 @@ probe = [
   "spacy>=3.8,<4",
   "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
 ]
+saebench = [
+  "sae-bench==0.6.0",
+]
 dev = ["pytest>=8", "ruff>=0.9"]
 
 [project.scripts]

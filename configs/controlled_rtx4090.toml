@@ -1,9 +1,9 @@
-run_dir = "runs/controlled-pythia160m"
-activation_dir = "data/pythia160m-layer8"
+run_dir = "runs/saebench-pythia160m-deduped"
+activation_dir = "data/saebench-pythia160m-deduped-layer8"
 
 [model]
-name = "EleutherAI/pythia-160m"
-revision = "step143000"
+name = "EleutherAI/pythia-160m-deduped"
+revision = "main"
 layer = 8
 dtype = "bfloat16"
 
@@ -92,3 +92,23 @@ probe_subjects = [
   "business_ethics",
 ]
 bootstrap_samples = 2000
+
+[sae_bench]
+enabled = true
+version = "0.6.0"
+model_name = "pythia-160m-deduped"
+eval_types = [
+  "core",
+  "sparse_probing",
+  "sparse_probing_sae_probes",
+  "ravel",
+]
+excluded_eval_types = ["scr", "tpp"]
+llm_batch_size = 256
+llm_dtype = "float32"
+force_rerun = false
+core_reconstruction_batches = 200
+core_sparsity_variance_batches = 2000
+core_prompt_batch_size = 16
+core_dataset = "Skylion007/openwebtext"
+context_size = 128

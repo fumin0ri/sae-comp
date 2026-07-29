@@ -137,6 +137,28 @@ class EvalConfig:
 
 
 @dataclass(frozen=True)
+class SAEBenchConfig:
+    enabled: bool = False
+    version: str = "0.6.0"
+    model_name: str = "pythia-160m-deduped"
+    eval_types: tuple[str, ...] = (
+        "core",
+        "sparse_probing",
+        "sparse_probing_sae_probes",
+        "ravel",
+    )
+    excluded_eval_types: tuple[str, ...] = ("scr", "tpp")
+    llm_batch_size: int = 256
+    llm_dtype: str = "float32"
+    force_rerun: bool = False
+    core_reconstruction_batches: int = 200
+    core_sparsity_variance_batches: int = 2_000
+    core_prompt_batch_size: int = 16
+    core_dataset: str = "Skylion007/openwebtext"
+    context_size: int = 128
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     run_dir: str = "runs/paper-pythia160m"
     activation_dir: str = "data/pythia160m-layer8"
@@ -146,6 +168,7 @@ class ExperimentConfig:
     train: TrainConfig = field(default_factory=TrainConfig)
     proposal: ProposalConfig = field(default_factory=ProposalConfig)
     evaluation: EvalConfig = field(default_factory=EvalConfig)
+    sae_bench: SAEBenchConfig = field(default_factory=SAEBenchConfig)
 
     def validate(self) -> None:
         if self.model.layer < 0:
@@ -180,12 +203,54 @@ class ExperimentConfig:
             )
         if not 0 <= self.proposal.predictor_warmup_steps < self.train.branch_steps:
             raise ValueError("predictor_warmup_steps must be smaller than branch_steps")
+        if not self.sae_bench.enabled:
+            return
+        allowed_saebench_evals = {
+            "core",
+            "sparse_probing",
+            "sparse_probing_sae_probes",
+            "ravel",
+        }
+        requested_saebench_evals = set(self.sae_bench.eval_types)
+        forbidden_saebench_evals = {"scr", "tpp"}
+        if requested_saebench_evals & forbidden_saebench_evals:
+            raise ValueError("SCR and TPP are explicitly excluded from this experiment")
+        unknown_saebench_evals = requested_saebench_evals - allowed_saebench_evals
+        if unknown_saebench_evals:
+            raise ValueError(
+                f"unsupported SAEBench eval types: {sorted(unknown_saebench_evals)}"
+            )
+        if set(self.sae_bench.excluded_eval_types) != forbidden_saebench_evals:
+            raise ValueError("sae_bench.excluded_eval_types must be exactly ['scr', 'tpp']")
+        if not requested_saebench_evals:
+            raise ValueError("sae_bench.eval_types must not be empty")
+        expected_model = f"EleutherAI/{self.sae_bench.model_name}"
+        if self.model.name != expected_model:
+            raise ValueError(
+                "training and SAEBench models must match exactly: "
+                f"expected model.name={expected_model!r}"
+            )
+        if self.model.revision != "main":
+            raise ValueError(
+                "SAEBench comparison uses the final deduplicated Pythia checkpoint; "
+                "model.revision must be 'main'"
+            )
+        if self.data.sequence_length != self.sae_bench.context_size:
+            raise ValueError(
+                "data.sequence_length and sae_bench.context_size must be identical"
+            )
+        if self.sae_bench.llm_batch_size < 4:
+            raise ValueError("sae_bench.llm_batch_size must be at least 4")
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["proposal"]["window_sizes"] = list(self.proposal.window_sizes)
         value["evaluation"]["probe_sparsities"] = list(self.evaluation.probe_sparsities)
         value["evaluation"]["probe_subjects"] = list(self.evaluation.probe_subjects)
+        value["sae_bench"]["eval_types"] = list(self.sae_bench.eval_types)
+        value["sae_bench"]["excluded_eval_types"] = list(
+            self.sae_bench.excluded_eval_types
+        )
         return value
 
     def fingerprint(self) -> str:
@@ -212,6 +277,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
         train=_section(TrainConfig, raw, "train"),
         proposal=_section(ProposalConfig, raw, "proposal"),
         evaluation=_section(EvalConfig, raw, "evaluation"),
+        sae_bench=_section(SAEBenchConfig, raw, "sae_bench"),
     )
     cfg.validate()
     return cfg
