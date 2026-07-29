@@ -26,8 +26,23 @@ cd sae-comp
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+python -m pip install \
+  torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+  --index-url https://download.pytorch.org/whl/cu124
 python -m pip install -e '.[saebench]'
+python -m sae_comp.cuda_check
+```
+
+PyTorch は `2.5.1` に固定しています。`pip install --upgrade` などで CUDA 13
+向け wheel に置き換わった場合、CUDA 12.x driver では初期化できません。修復には
+次を実行してください。
+
+```bash
+python -m pip install --force-reinstall \
+  torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+  --index-url https://download.pytorch.org/whl/cu124
+python -m pip install -e '.[saebench]'
+python -m sae_comp.cuda_check
 ```
 
 必要なら Hugging Face の token を設定してください。
