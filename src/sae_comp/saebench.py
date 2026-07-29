@@ -200,6 +200,24 @@ def _verify_results(output_dir: Path, labels: list[str], eval_type: str) -> None
         )
 
 
+def _ravel_protocol_mismatch(
+    output_dir: Path,
+    labels: list[str],
+    expected_selection: dict[str, list[str]],
+) -> bool:
+    for label in labels:
+        path = _result_path(output_dir, label)
+        if not path.is_file():
+            continue
+        result = json.loads(path.read_text(encoding="utf-8"))
+        recorded_selection = result.get("eval_config", {}).get(
+            "entity_attribute_selection"
+        )
+        if recorded_selection != expected_selection:
+            return True
+    return False
+
+
 def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -226,6 +244,12 @@ def run_saebench(cfg: ExperimentConfig) -> Path:
         (label, checkpoint_to_saebench(path, label, cfg))
         for label, path in checkpoint_paths.items()
     ]
+    ravel_selection = {
+        entity_class: list(attributes)
+        for entity_class, attributes in (
+            cfg.sae_bench.ravel_entity_attribute_selection.items()
+        )
+    }
     manifest: dict[str, Any] = {
         "status": "running",
         "saebench_version": installed_version,
@@ -234,6 +258,7 @@ def run_saebench(cfg: ExperimentConfig) -> Path:
         "hook_name": f"blocks.{cfg.model.layer}.hook_resid_post",
         "eval_types": list(cfg.sae_bench.eval_types),
         "excluded_eval_types": list(cfg.sae_bench.excluded_eval_types),
+        "ravel_entity_attribute_selection": ravel_selection,
         "conditions": {
             label: str(path) for label, path in checkpoint_paths.items()
         },
@@ -319,8 +344,17 @@ def run_saebench(cfg: ExperimentConfig) -> Path:
                 from sae_bench.evals.ravel import main as ravel
                 from sae_bench.evals.ravel.eval_config import RAVELEvalConfig
 
+                ravel_force_rerun = (
+                    cfg.sae_bench.force_rerun
+                    or _ravel_protocol_mismatch(
+                        output_dir,
+                        labels,
+                        ravel_selection,
+                    )
+                )
                 ravel.run_eval(
                     RAVELEvalConfig(
+                        entity_attribute_selection=ravel_selection,
                         model_name=cfg.sae_bench.model_name,
                         random_seed=cfg.train.seed,
                         llm_batch_size=max(1, cfg.sae_bench.llm_batch_size // 4),
@@ -330,7 +364,7 @@ def run_saebench(cfg: ExperimentConfig) -> Path:
                     selected_saes,
                     cfg.train.device,
                     str(output_dir),
-                    force_rerun=cfg.sae_bench.force_rerun,
+                    force_rerun=ravel_force_rerun,
                     artifacts_path=str(artifacts),
                 )
             else:  # Protected by ExperimentConfig.validate.

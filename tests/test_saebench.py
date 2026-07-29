@@ -7,7 +7,11 @@ import torch
 
 from sae_comp.config import load_config
 from sae_comp.models import SparseAutoencoder, SparseAutoencoderConfig
-from sae_comp.saebench import AdapterConfig, SAEBenchAdapter
+from sae_comp.saebench import (
+    AdapterConfig,
+    SAEBenchAdapter,
+    _ravel_protocol_mismatch,
+)
 from sae_comp.saebench_report import build_saebench_report, collect_saebench_summary
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +70,9 @@ def test_controlled_config_enables_only_allowlisted_saebench_evals() -> None:
         "ravel",
     ]
     assert cfg.sae_bench.excluded_eval_types == ["scr", "tpp"]
+    assert cfg.sae_bench.ravel_entity_attribute_selection == {
+        "city": ["Country", "Continent", "Language"]
+    }
     assert cfg.proposal.window_sizes == [16, 32, 64]
 
 
@@ -78,6 +85,36 @@ def test_controlled_config_rejects_scr_or_tpp(tmp_path: Path) -> None:
     path.write_text(source, encoding="utf-8")
     with pytest.raises(ValueError, match="explicitly excluded"):
         load_config(path)
+
+
+def test_ravel_protocol_mismatch_detects_stale_results(tmp_path: Path) -> None:
+    expected = {"city": ["Country", "Continent", "Language"]}
+    assert not _ravel_protocol_mismatch(tmp_path, ["standard"], expected)
+    path = tmp_path / "standard_custom_sae_eval_results.json"
+    path.write_text(
+        json.dumps(
+            {
+                "eval_config": {
+                    "entity_attribute_selection": expected,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not _ravel_protocol_mismatch(tmp_path, ["standard"], expected)
+    path.write_text(
+        json.dumps(
+            {
+                "eval_config": {
+                    "entity_attribute_selection": {
+                        "nobel_prize_winner": ["Field", "Gender"]
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _ravel_protocol_mismatch(tmp_path, ["standard"], expected)
 
 
 def test_saebench_summary_reads_official_result_shape(tmp_path: Path) -> None:

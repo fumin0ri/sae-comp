@@ -22,6 +22,11 @@ Absorption は SAEBench が2B未満のモデルに推奨していないため、
 本比較には含めません。AutoInterp は外部 API credential が必要で、Unlearning は
 この Pythia residual-stream 比較の標準対象ではないため含めません。
 
+RAVEL は `city` の `Country`、`Continent`、`Language` に固定します。
+Pythia-160Mでは正答フィルタ後の `nobel_prize_winner/Gender` が単一ラベルに
+縮退する場合があり、異なる属性ラベルの介入ペアを構成できないためです。この
+city-only設定はSAEBench v0.6.0のRAVEL acceptance testとも一致します。
+
 ## Custom SAE adapter
 
 ローカル SAE の再構成は次式です。

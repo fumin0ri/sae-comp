@@ -156,6 +156,11 @@ class SAEBenchConfig:
     core_prompt_batch_size: int = 16
     core_dataset: str = "Skylion007/openwebtext"
     context_size: int = 128
+    ravel_entity_attribute_selection: dict[str, tuple[str, ...]] = field(
+        default_factory=lambda: {
+            "city": ("Country", "Continent", "Language"),
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -241,6 +246,22 @@ class ExperimentConfig:
             )
         if self.sae_bench.llm_batch_size < 4:
             raise ValueError("sae_bench.llm_batch_size must be at least 4")
+        ravel_selection = self.sae_bench.ravel_entity_attribute_selection
+        if "ravel" in requested_saebench_evals and not ravel_selection:
+            raise ValueError(
+                "sae_bench.ravel_entity_attribute_selection must not be empty"
+            )
+        for entity_class, attributes in ravel_selection.items():
+            if not entity_class:
+                raise ValueError("RAVEL entity class names must not be empty")
+            if len(attributes) < 2:
+                raise ValueError(
+                    f"RAVEL entity class {entity_class!r} needs at least two attributes"
+                )
+            if len(set(attributes)) != len(attributes):
+                raise ValueError(
+                    f"RAVEL attributes for {entity_class!r} must be unique"
+                )
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)

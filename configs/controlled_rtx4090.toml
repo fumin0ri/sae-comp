@@ -112,3 +112,4 @@ core_sparsity_variance_batches = 2000
 core_prompt_batch_size = 16
 core_dataset = "Skylion007/openwebtext"
 context_size = 128
+ravel_entity_attribute_selection = { city = ["Country", "Continent", "Language"] }
