@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import tomllib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -291,3 +292,119 @@ def load_config(path: str | Path) -> ExperimentConfig:
     )
     cfg.validate()
     return cfg
+
+
+def apply_training_overrides(
+    cfg: ExperimentConfig,
+    *,
+    training_scale: float = 1.0,
+    standard_steps: int | None = None,
+    branch_steps: int | None = None,
+    warmup_steps: int | None = None,
+    predictor_warmup_steps: int | None = None,
+    prediction_ramp_steps: int | None = None,
+    run_dir: str | None = None,
+) -> ExperimentConfig:
+    """Resolve runtime training-budget overrides into a validated config.
+
+    The scale changes optimizer-step counts and their associated schedules, not
+    batch sizes. Explicit step values take precedence over the scale. When the
+    budget changes and no run directory is supplied, a deterministic suffix is
+    added so SAEBench cannot silently reuse results from another budget.
+    """
+
+    if not math.isfinite(training_scale) or training_scale <= 0:
+        raise ValueError("training_scale must be a finite positive number")
+
+    def scaled(value: int, *, allow_zero: bool = False) -> int:
+        result = int(round(value * training_scale))
+        return max(0 if allow_zero else 1, result)
+
+    resolved_standard = (
+        scaled(cfg.train.standard_steps)
+        if standard_steps is None
+        else standard_steps
+    )
+    resolved_branch = (
+        scaled(cfg.train.branch_steps) if branch_steps is None else branch_steps
+    )
+    resolved_warmup = (
+        scaled(cfg.train.warmup_steps, allow_zero=True)
+        if warmup_steps is None
+        else warmup_steps
+    )
+    resolved_predictor_warmup = (
+        scaled(cfg.proposal.predictor_warmup_steps, allow_zero=True)
+        if predictor_warmup_steps is None
+        else predictor_warmup_steps
+    )
+    resolved_prediction_ramp = (
+        scaled(cfg.proposal.prediction_ramp_steps)
+        if prediction_ramp_steps is None
+        else prediction_ramp_steps
+    )
+    if resolved_standard < 1 or resolved_branch < 1:
+        raise ValueError("standard_steps and branch_steps must be positive")
+    if resolved_warmup < 0 or resolved_predictor_warmup < 0:
+        raise ValueError("warmup step counts must be non-negative")
+    if resolved_prediction_ramp < 1:
+        raise ValueError("prediction_ramp_steps must be positive")
+
+    base_budget = (
+        cfg.train.standard_steps,
+        cfg.train.branch_steps,
+        cfg.train.warmup_steps,
+        cfg.proposal.predictor_warmup_steps,
+        cfg.proposal.prediction_ramp_steps,
+    )
+    resolved_budget = (
+        resolved_standard,
+        resolved_branch,
+        resolved_warmup,
+        resolved_predictor_warmup,
+        resolved_prediction_ramp,
+    )
+    budget_changed = resolved_budget != base_budget
+
+    resolved_run_dir = run_dir
+    if resolved_run_dir is None:
+        resolved_run_dir = cfg.run_dir
+        if budget_changed:
+            only_scaled = all(
+                value is None
+                for value in (
+                    standard_steps,
+                    branch_steps,
+                    warmup_steps,
+                    predictor_warmup_steps,
+                    prediction_ramp_steps,
+                )
+            )
+            if only_scaled:
+                scale_tag = f"{training_scale:.8g}".replace(".", "p")
+                suffix = f"trainx{scale_tag}"
+            else:
+                suffix = (
+                    f"budget-s{resolved_standard}-b{resolved_branch}"
+                    f"-w{resolved_warmup}-pw{resolved_predictor_warmup}"
+                    f"-pr{resolved_prediction_ramp}"
+                )
+            resolved_run_dir = f"{cfg.run_dir}-{suffix}"
+
+    resolved = replace(
+        cfg,
+        run_dir=resolved_run_dir,
+        train=replace(
+            cfg.train,
+            standard_steps=resolved_standard,
+            branch_steps=resolved_branch,
+            warmup_steps=resolved_warmup,
+        ),
+        proposal=replace(
+            cfg.proposal,
+            predictor_warmup_steps=resolved_predictor_warmup,
+            prediction_ramp_steps=resolved_prediction_ramp,
+        ),
+    )
+    resolved.validate()
+    return resolved

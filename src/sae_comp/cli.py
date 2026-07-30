@@ -4,7 +4,7 @@ import argparse
 from collections.abc import Callable
 
 from .activations import extract_activations
-from .config import ExperimentConfig, load_config
+from .config import ExperimentConfig, apply_training_overrides, load_config
 from .evaluation import (
     evaluate_all,
     evaluate_controlled_comparison,
@@ -45,6 +45,30 @@ STAGES: tuple[Stage, ...] = (
 )
 
 
+def _add_training_override_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--training-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "multiply shared/branch steps and warm-up/ramp schedules; "
+            "batch sizes remain fixed"
+        ),
+    )
+    parser.add_argument("--standard-steps", type=int)
+    parser.add_argument("--branch-steps", type=int)
+    parser.add_argument("--warmup-steps", type=int)
+    parser.add_argument("--predictor-warmup-steps", type=int)
+    parser.add_argument("--prediction-ramp-steps", type=int)
+    parser.add_argument(
+        "--run-dir",
+        help=(
+            "override the output directory; otherwise a changed training budget "
+            "gets a deterministic suffix"
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Compare standard, temporal, and transition-JEPA SAEs"
@@ -53,10 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
     for command, _ in STAGES:
         child = subparsers.add_parser(command)
         child.add_argument("--config", required=True)
+        _add_training_override_arguments(child)
         if command in {"extract", "probes"}:
             child.add_argument("--overwrite", action="store_true")
     run = subparsers.add_parser("run")
     run.add_argument("--config", required=True)
+    _add_training_override_arguments(run)
     run.add_argument(
         "--stages",
         default="extract,train,evaluate,probes,report",
@@ -67,7 +93,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    cfg = load_config(args.config)
+    cfg = apply_training_overrides(
+        load_config(args.config),
+        training_scale=args.training_scale,
+        standard_steps=args.standard_steps,
+        branch_steps=args.branch_steps,
+        warmup_steps=args.warmup_steps,
+        predictor_warmup_steps=args.predictor_warmup_steps,
+        prediction_ramp_steps=args.prediction_ramp_steps,
+        run_dir=args.run_dir,
+    )
+    print(
+        "training budget: "
+        f"shared={cfg.train.standard_steps} steps, "
+        f"branch={cfg.train.branch_steps} steps, "
+        f"warmup={cfg.train.warmup_steps}, "
+        f"predictor_warmup={cfg.proposal.predictor_warmup_steps}, "
+        f"prediction_ramp={cfg.proposal.prediction_ramp_steps}, "
+        f"run_dir={cfg.run_dir}"
+    )
     if args.command == "extract":
         print(extract_activations(cfg, overwrite=args.overwrite))
     elif args.command == "train":

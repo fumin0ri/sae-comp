@@ -86,6 +86,48 @@ sae-comp report-saebench --config configs/controlled_rtx4090.toml
 SAEBench の既存結果は再利用されます。全評価を再計算する場合は
 `configs/controlled_rtx4090.toml` の `force_rerun` を `true` に変更します。
 
+## 学習量の変更
+
+設定ファイルを編集せず、実験全体の学習stepとscheduleを倍率指定できます。
+
+```bash
+TRAINING_SCALE=2 bash scripts/run_controlled.sh
+```
+
+この例ではshared SAE pretraining、全branch、optimizer warm-up、proposal predictor
+warm-up、prediction rampがすべて2倍になります。batch sizeと1 stepあたりの
+residual position数は変わらないため、手法間とW間の比較条件は維持されます。
+出力先は自動的に次へ分離されます。
+
+```text
+runs/saebench-pythia160m-deduped-fixed-endpoint-v2-trainx2/
+```
+
+step数を個別に指定することもできます。
+
+```bash
+STANDARD_STEPS=30000 \
+BRANCH_STEPS=15000 \
+WARMUP_STEPS=1200 \
+PREDICTOR_WARMUP_STEPS=2000 \
+PREDICTION_RAMP_STEPS=2000 \
+RUN_DIR_OVERRIDE=runs/sae-custom-budget \
+bash scripts/run_controlled.sh
+```
+
+同じ指定はCLIからも利用できます。個別step指定は`--training-scale`より優先されます。
+
+```bash
+sae-comp run \
+  --config configs/controlled_rtx4090.toml \
+  --stages extract,train-controls,train-window-sweep,saebench,report-saebench \
+  --training-scale 2
+```
+
+別stageを後から実行するときは、同じ倍率または同じ個別overrideを渡してください。
+学習予算が変わり`--run-dir`を省略した場合は、予算固有のsuffixが自動付与されるため、
+異なる学習量のcheckpointやSAEBench結果は混ざりません。
+
 ## 実験条件
 
 - frozen LLM: `EleutherAI/pythia-160m-deduped`
