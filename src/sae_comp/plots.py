@@ -26,7 +26,7 @@ def display_name(label: str) -> str:
     if label == "temporal":
         return "Temporal SAE"
     if label.startswith("proposal_w"):
-        return f"Proposal W={int(label.removeprefix('proposal_w'))}"
+        return f"Hierarchical proposal W={int(label.removeprefix('proposal_w'))}"
     return label
 
 

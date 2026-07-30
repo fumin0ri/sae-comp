@@ -213,8 +213,9 @@ def build_controlled_report(cfg: ExperimentConfig) -> Path:
         f"- Seed: {experiment['seed']}",
         "",
         "The Pythia-160m layer-8, 16k-feature, k=20 configuration follows the "
-        "Temporal SAE paper's principal Pythia setup. Standard and proposal "
-        "conditions use token-wise Top-K; Temporal SAE uses BatchTopK training.",
+        "Temporal SAE paper's principal Pythia setup. Standard uses global "
+        "token-wise Top-K; the hierarchical proposal uses independent high/low "
+        "Top-K budgets; Temporal SAE uses BatchTopK training.",
         "",
         "## Controlled branch-training budget",
         "",

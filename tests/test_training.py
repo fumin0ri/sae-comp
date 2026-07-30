@@ -71,7 +71,12 @@ def test_proposal_loss_uses_fixed_endpoint_and_all_contexts() -> None:
     assert torch.isfinite(loss)
     assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
     assert "online_reconstruction_fvu" in metrics
+    assert "online_high_reconstruction_fvu" in metrics
+    assert "weighted_reconstruction_fvu" in metrics
     assert "ema_reconstruction_fvu" in metrics
+    assert "ema_high_reconstruction_fvu" in metrics
+    assert metrics["high_l0"] <= proposal.cfg.k_high
+    assert metrics["low_l0"] <= proposal.cfg.k_low
     assert "variance_loss" not in metrics
     assert all(
         f"context_{position}_horizon_{7 - position}_cosine" in metrics

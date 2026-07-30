@@ -64,6 +64,7 @@ def test_proposal_checkpoint_exports_full_ema_sae(tmp_path) -> None:
     torch.testing.assert_close(final_sae.encoder.weight, proposal.ema_encoder.weight)
     torch.testing.assert_close(final_sae.decoder, proposal.ema_decoder)
     assert not torch.allclose(final_sae.pre_bias, proposal.sae.pre_bias)
+    assert final_sae.cfg.group_topk
 
 
 def test_obsolete_proposal_checkpoint_is_rejected(tmp_path) -> None:

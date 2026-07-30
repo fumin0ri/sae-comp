@@ -27,6 +27,9 @@ def _adapter(sae: SparseAutoencoder, *, temporal: bool) -> SAEBenchAdapter:
         feature_scale=scale,
         threshold=sae.threshold.detach(),
         use_threshold=temporal,
+        use_group_topk=sae.cfg.group_topk,
+        group_high_size=sae.cfg.group_high_size,
+        group_high_k=sae.cfg.group_high_k,
         k=sae.cfg.k,
         cfg=AdapterConfig(
             model_name="pythia-160m-deduped",
@@ -58,6 +61,27 @@ def test_saebench_adapter_preserves_local_sae(
     assert adapter.check_decoder_norms()
     assert adapter.W_enc.shape == (12, 32)
     assert adapter.W_dec.shape == (32, 12)
+
+
+@pytest.mark.parametrize("shape", [(7, 12), (2, 7, 12)])
+def test_saebench_adapter_preserves_grouped_topk(shape: tuple[int, ...]) -> None:
+    torch.manual_seed(2)
+    sae = SparseAutoencoder(
+        SparseAutoencoderConfig(
+            d_in=12,
+            d_sae=20,
+            k=5,
+            high_fraction=0.2,
+            group_topk=True,
+        )
+    )
+    sae.initialize_normalization(torch.randn(12), 1.7)
+    adapter = _adapter(sae, temporal=False)
+    values = torch.randn(shape)
+    code = sae.encode_token_topk(values)
+    torch.testing.assert_close(adapter.encode(values), code * 1.7)
+    torch.testing.assert_close(adapter(values), sae.decode(code))
+    assert adapter.use_group_topk
 
 
 def test_controlled_config_enables_only_allowlisted_saebench_evals() -> None:

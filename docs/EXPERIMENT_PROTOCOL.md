@@ -2,10 +2,10 @@
 
 ## Question
 
-Does an all-context, fixed-endpoint Transition JEPA objective reshape a sparse
-dictionary so that its final full-EMA SAE preserves reconstruction while
-exposing more sequence-level semantic and contextual state than a
-reconstruction-only SAE or a Temporal SAE?
+Does a T-SAE-inspired high/low fixed-endpoint JEPA objective separate a
+forecastable high-level state from low-level endpoint detail while its final
+full-EMA SAE preserves reconstruction better than a reconstruction-only SAE
+or a Temporal SAE?
 
 ## Prespecified primary outcomes
 
@@ -41,10 +41,11 @@ representation is not by itself evidence of better forecastable state.
 
 ## Method fidelity
 
-The standard and proposal conditions use token-wise Top-K as in
-`fumin0ri/my-sae`. The Temporal condition uses BatchTopK during training and an
-EMA threshold at inference as in the T-SAE reference. This preserves each
-method's intended sparsifier, but means the achieved L0 and fraction alive
+The standard condition uses token-wise global Top-K. The proposal partitions
+the same total dictionary and L0 budget into 20% high and 80% low blocks and
+applies an independent Top-K budget to each. The Temporal condition uses
+BatchTopK during training and an EMA threshold at inference. This preserves
+each method's intended sparsifier, but means achieved L0 and fraction alive
 must be reported rather than assumed equal.
 
 The T-SAE objective follows the paper equation: a 20% high-level dictionary
@@ -54,13 +55,20 @@ high-level codes. It intentionally uses the paper's cosine objective rather
 than the unnormalized dot-product logits present in one public training
 script.
 
-For a window endpoint `T=W-1`, the proposal predictor separately maps every
-earlier code and its absolute context position,
-`P(z_k, position(k))`, to the same stop-gradient full-EMA endpoint code `z_T`.
-It does not pool contexts or receive intervening tokens. The online SAE
-reconstructs only the endpoint. The sparse predicted code is decoded through
-the frozen EMA decoder, and the final downstream artifact is the EMA encoder,
-decoder, and normalization bias. Variance regularization is excluded.
+For endpoint `T=W-1`, the proposal maps every earlier high code and its
+position, `P(z_high_k, position(k))`, to the same stop-gradient EMA high code
+`z_high_T`. The high block reconstructs the endpoint alone and is the only
+forecast-supervised block. The low block receives gradients through cumulative
+full reconstruction only:
+
+```text
+Lrec = 0.2 * FVU(Dhigh(zhigh), hT)
+     + 0.8 * FVU(Dhigh(zhigh) + Dlow(zlow), hT)
+```
+
+The predicted high code is decoded through the frozen EMA high decoder. The
+entire online high/low SAE is EMA-updated and the final artifact retains both
+groups. Variance regularization is excluded.
 
 The window sweep fixes optimizer steps and residual positions read per step.
 Because the architecture requires all `W-1` contexts, context-target pair

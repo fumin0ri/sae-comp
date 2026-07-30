@@ -73,6 +73,8 @@ class ProposalConfig:
     window_size: int = 10
     window_sizes: tuple[int, ...] = (8, 16, 32, 64, 128)
     sweep_residual_positions_per_step: int = 512
+    high_fraction: float = 0.2
+    high_reconstruction_weight: float = 0.2
     predictor_width: int = 256
     predictor_expansion: int = 2
     predictor_warmup_steps: int = 800
@@ -155,7 +157,7 @@ class SAEBenchConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    run_dir: str = "runs/paper-pythia160m"
+    run_dir: str = "runs/paper-pythia160m-hierarchical-v1"
     activation_dir: str = "data/pythia160m-layer8"
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
@@ -186,10 +188,21 @@ class ExperimentConfig:
                     "sequence_length must be at least every proposal window size"
                 )
             self.proposal.sweep_budget(window_size)
-        if self.sae.k < 1 or self.sae.k > self.sae.dictionary_size:
-            raise ValueError("sae.k must lie in [1, dictionary_size]")
+        if self.sae.k < 2 or self.sae.k > self.sae.dictionary_size:
+            raise ValueError(
+                "sae.k must lie in [2, dictionary_size] so both proposal groups "
+                "receive a positive Top-K budget"
+            )
         if not 0 < self.sae.high_fraction < 1:
             raise ValueError("sae.high_fraction must lie in (0, 1)")
+        if not 0 <= self.sae.high_reconstruction_weight <= 1:
+            raise ValueError("sae.high_reconstruction_weight must lie in [0, 1]")
+        if not 0 < self.proposal.high_fraction < 1:
+            raise ValueError("proposal.high_fraction must lie in (0, 1)")
+        if not 0 <= self.proposal.high_reconstruction_weight <= 1:
+            raise ValueError(
+                "proposal.high_reconstruction_weight must lie in [0, 1]"
+            )
         if self.train.standard_steps < 1 or self.train.branch_steps < 1:
             raise ValueError("training step counts must be positive")
         if not 1 <= self.train.temporal_pairs_per_step <= self.train.token_batch_size:

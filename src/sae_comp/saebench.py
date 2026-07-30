@@ -68,6 +68,9 @@ class SAEBenchAdapter(nn.Module):
         feature_scale: torch.Tensor,
         threshold: torch.Tensor,
         use_threshold: bool,
+        use_group_topk: bool,
+        group_high_size: int,
+        group_high_k: int,
         k: int,
         cfg: AdapterConfig,
     ):
@@ -79,6 +82,9 @@ class SAEBenchAdapter(nn.Module):
         self.register_buffer("feature_scale", feature_scale.detach().clone())
         self.register_buffer("threshold", threshold.detach().clone())
         self.use_threshold = use_threshold
+        self.use_group_topk = use_group_topk
+        self.group_high_size = group_high_size
+        self.group_high_k = group_high_k
         self.k = k
         self.cfg = cfg
         self.device = self.W_enc.device
@@ -89,6 +95,22 @@ class SAEBenchAdapter(nn.Module):
         positive = F.relu(preactivations)
         if self.use_threshold:
             code = positive * (positive > self.threshold)
+        elif self.use_group_topk:
+            high = positive[..., : self.group_high_size]
+            low = positive[..., self.group_high_size :]
+            high_selected = high.topk(
+                self.group_high_k, dim=-1, sorted=False
+            )
+            low_selected = low.topk(
+                self.k - self.group_high_k, dim=-1, sorted=False
+            )
+            high_code = torch.zeros_like(high).scatter_(
+                -1, high_selected.indices, high_selected.values
+            )
+            low_code = torch.zeros_like(low).scatter_(
+                -1, low_selected.indices, low_selected.values
+            )
+            code = torch.cat((high_code, low_code), dim=-1)
         else:
             selected = positive.topk(self.k, dim=-1, sorted=False)
             code = torch.zeros_like(positive).scatter_(
@@ -130,11 +152,15 @@ def checkpoint_to_saebench(
         "standard": "standard-topk",
         "temporal": "temporal-batchtopk",
         "proposal": (
-            "transition-jepa-fixed-endpoint-full-ema-"
+            "hierarchical-high-low-fixed-endpoint-full-ema-"
             f"{label.removeprefix('proposal_')}"
         ),
     }[method]
-    activation_fn = "threshold" if method == "temporal" else "topk"
+    activation_fn = {
+        "standard": "topk",
+        "temporal": "threshold",
+        "proposal": "topk",
+    }[method]
     training_tokens = (
         (cfg.train.standard_steps + cfg.train.branch_steps)
         * cfg.train.token_batch_size
@@ -149,7 +175,19 @@ def checkpoint_to_saebench(
         context_size=cfg.sae_bench.context_size,
         architecture=architecture,
         activation_fn_str=activation_fn,
-        activation_fn_kwargs={"k": sae.cfg.k},
+        activation_fn_kwargs={
+            "k": sae.cfg.k,
+            **(
+                {
+                    "high_size": sae.cfg.group_high_size,
+                    "high_k": sae.cfg.group_high_k,
+                    "low_k": sae.cfg.group_low_k,
+                    "grouped": True,
+                }
+                if sae.cfg.group_topk
+                else {}
+            ),
+        },
         dtype="float32",
         device="cpu",
         dataset_path=cfg.data.dataset,
@@ -163,6 +201,9 @@ def checkpoint_to_saebench(
         feature_scale=scale,
         threshold=sae.threshold.detach().float(),
         use_threshold=method == "temporal",
+        use_group_topk=sae.cfg.group_topk,
+        group_high_size=sae.cfg.group_high_size,
+        group_high_k=sae.cfg.group_high_k,
         k=sae.cfg.k,
         cfg=adapter_cfg,
     )

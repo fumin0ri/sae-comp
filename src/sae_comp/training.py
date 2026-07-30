@@ -22,7 +22,7 @@ from .models import (
     TransitionJEPAConfig,
 )
 
-PROPOSAL_SOURCE_COMMIT = "bdc0b4183741df4e0ecb62708c95bfc78cf79194"
+PROPOSAL_SOURCE_COMMIT = "945a5aa54ab955064e8ed50cdcaefcc2a71fed16"
 
 
 def _autocast(device: torch.device, dtype: str):
@@ -338,12 +338,22 @@ def _proposal_loss(
     residual_scale = (
         endpoint - model.sae.pre_bias.detach()
     ).float().square().mean().clamp_min(1e-8)
-    reconstruction = (
+    high_reconstruction = (
+        output["online_high_reconstruction"] - endpoint
+    ).float().square().mean() / residual_scale
+    full_reconstruction = (
         output["online_target_reconstruction"] - endpoint
     ).float().square().mean() / residual_scale
+    reconstruction = (
+        model.cfg.high_reconstruction_weight * high_reconstruction
+        + (1 - model.cfg.high_reconstruction_weight) * full_reconstruction
+    )
     ema_residual_scale = (
         endpoint - model.ema_pre_bias.detach()
     ).float().square().mean().clamp_min(1e-8)
+    ema_high_reconstruction = (
+        output["target_high_reconstruction"] - endpoint
+    ).float().square().mean() / ema_residual_scale
     ema_reconstruction = (
         output["target_reconstruction"] - endpoint
     ).float().square().mean() / ema_residual_scale
@@ -374,8 +384,11 @@ def _proposal_loss(
     union = (predicted_active | target_active).sum(dim=-1).float().clamp_min(1)
     metrics = {
         "loss": float(loss.detach()),
-        "online_reconstruction_fvu": float(reconstruction.detach()),
+        "online_reconstruction_fvu": float(full_reconstruction.detach()),
+        "online_high_reconstruction_fvu": float(high_reconstruction.detach()),
+        "weighted_reconstruction_fvu": float(reconstruction.detach()),
         "ema_reconstruction_fvu": float(ema_reconstruction.detach()),
+        "ema_high_reconstruction_fvu": float(ema_high_reconstruction.detach()),
         "prediction_loss": float(prediction_loss.detach()),
         "code_cosine": float(cosine.mean().detach()),
         "code_nrmse": float(normalized_mse.mean().detach()),
@@ -385,6 +398,12 @@ def _proposal_loss(
         "residual_prediction_fvu": float(residual_prediction.detach()),
         "sae_l0": float(
             (output["codes"] > 0).sum(dim=-1).float().mean().detach()
+        ),
+        "high_l0": float(
+            (output["high_codes"] > 0).sum(dim=-1).float().mean().detach()
+        ),
+        "low_l0": float(
+            (output["low_codes"] > 0).sum(dim=-1).float().mean().detach()
         ),
     }
     target_position = model.cfg.window_size - 1
@@ -709,7 +728,8 @@ def train_all(cfg: ExperimentConfig) -> dict[str, Path]:
         d_sae=sae_cfg.d_sae,
         k=sae_cfg.k,
         window_size=cfg.proposal.window_size,
-        high_fraction=sae_cfg.high_fraction,
+        high_fraction=cfg.proposal.high_fraction,
+        high_reconstruction_weight=cfg.proposal.high_reconstruction_weight,
         predictor_width=cfg.proposal.predictor_width,
         predictor_expansion=cfg.proposal.predictor_expansion,
         ema_decay=cfg.proposal.ema_decay,
@@ -769,7 +789,8 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
         d_sae=sae_cfg.d_sae,
         k=sae_cfg.k,
         window_size=maximum_window,
-        high_fraction=sae_cfg.high_fraction,
+        high_fraction=cfg.proposal.high_fraction,
+        high_reconstruction_weight=cfg.proposal.high_reconstruction_weight,
         predictor_width=cfg.proposal.predictor_width,
         predictor_expansion=cfg.proposal.predictor_expansion,
         ema_decay=cfg.proposal.ema_decay,
@@ -787,7 +808,8 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
             d_sae=sae_cfg.d_sae,
             k=sae_cfg.k,
             window_size=window_size,
-            high_fraction=sae_cfg.high_fraction,
+            high_fraction=cfg.proposal.high_fraction,
+            high_reconstruction_weight=cfg.proposal.high_reconstruction_weight,
             predictor_width=cfg.proposal.predictor_width,
             predictor_expansion=cfg.proposal.predictor_expansion,
             ema_decay=cfg.proposal.ema_decay,
@@ -811,7 +833,7 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
             cfg,
             window_batch_size=budget["batch_windows"],
             minimum_sequence_length=maximum_window,
-            description=f"transition JEPA W={window_size}",
+            description=f"hierarchical transition JEPA W={window_size}",
         )
         budget_record = {
             **budget,

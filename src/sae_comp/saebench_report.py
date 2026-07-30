@@ -419,11 +419,23 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
             "- Compared conditions: Standard Top-K SAE, Temporal SAE, and proposal "
             "W=16, W=32, W=64"
         ),
+        (
+            f"- Proposal architecture: hierarchical high/low fixed-endpoint JEPA; "
+            f"high={cfg.proposal.high_fraction:.0%}, "
+            f"low={1 - cfg.proposal.high_fraction:.0%}, independent group Top-K"
+        ),
+        (
+            "- Proposal reconstruction: "
+            f"{cfg.proposal.high_reconstruction_weight:.0%} high-only FVU + "
+            f"{1 - cfg.proposal.high_reconstruction_weight:.0%} full FVU"
+        ),
         "- Explicitly excluded SAEBench evaluations: SCR and TPP",
         "",
         (
-            "Every proposal width uses the same reconstruction-token and forecast-pair "
-            "budget. All five conditions are evaluated with the same SAEBench settings."
+            "Every proposal width uses the same optimizer-step and residual-position "
+            "budget. The architecture uses all W-1 contexts, so pair counts vary with "
+            "W and each prediction loss is averaged over its pairs. All five "
+            "conditions use the same SAEBench settings."
         ),
         "",
     ]

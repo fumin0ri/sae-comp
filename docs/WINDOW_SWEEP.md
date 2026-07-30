@@ -1,7 +1,7 @@
 # Proposal window-width sweep
 
 提案手法は `W = 16, 32, 64` の3条件で比較します。全条件は
-`runs/saebench-pythia160m-deduped-fixed-endpoint-v2/checkpoints/shared_initialization.pt`
+`runs/saebench-pythia160m-deduped-hierarchical-v1/checkpoints/shared_initialization.pt`
 から開始します。
 
 ## 等学習量の制御
@@ -21,21 +21,23 @@
 最大Wの predictor を共通初期値として作成し、小さいWでは position embedding の
 先頭部分をコピーします。これにより共有可能なパラメータの初期値も一致します。
 
-## 提案手法の固定終端目的
+## 提案手法のhigh/low固定終端目的
 
 `T=W-1` とすると、各 `k=0,...,T-1` について
-`P(z_k, position(k))` が同じstop-gradient EMA target `z_T` を予測します。
-online SAEは終端だけを再構成し、予測codeのTop-K版はfrozen EMA decoderで
-residualへ戻します。joint phase後はonline encoder、decoder、pre-biasをEMA更新し、
-その完全EMA SAEをSAEBenchへ渡します。variance regularizerは使用しません。
+`P(z_high_k, position(k))` が同じstop-gradient EMA target `z_high_T` を予測します。
+辞書と総Top-Kを20% high / 80% lowへ分けて独立Top-Kを適用します。high-only
+終端再構成へ0.2、high+lowのfull再構成へ0.8を与え、lowには予測lossを与えません。
+予測high codeはfrozen EMA high decoderでresidualへ戻します。joint phase後は
+high/low全体のonline encoder、decoder、pre-biasをEMA更新し、その完全EMA SAEを
+SAEBenchへ渡します。variance regularizerは使用しません。
 
 ## 評価
 
-Standard Top-K SAE、Temporal SAE、3つのWの完全EMA SAEを同じcustom SAE
+Standard Top-K SAE、Temporal SAE、3つのWの階層型完全EMA SAEを同じcustom SAE
 interfaceに変換し、
 同一の SAEBench 呼び出しに渡します。SAEBench adapter は decoder の unit norm を
 保ったまま activation normalization を feature scale に移すため、元 checkpoint と
-再構成結果が一致します。
+再構成結果が一致します。Proposal adapterはhigh/lowの独立Top-Kも保持します。
 
 実行する評価は `core`、`sparse_probing`、
 `sparse_probing_sae_probes`、`RAVEL` です。TPP と SCR は実行しません。

@@ -50,8 +50,9 @@ x_hat = feature_acts @ W_dec + b_dec
 
 この変換は Standard、Temporal、Proposal の全 checkpoint で元の encode/decode
 再構成を保存します。Proposalではonline studentではなく、encoder、decoder、
-normalization biasを含む完全EMA teacherを変換します。Temporal SAEだけは学習済み
-thresholdを使用し、それ以外はtoken-wise Top-Kを使用します。
+normalization biasを含む完全EMA teacherを変換し、20% high / 80% lowの独立
+Top-Kをadapter内でも再現します。Standardはglobal token-wise Top-K、Temporal
+SAEは学習済みthresholdを使用します。
 
 ## Resume and outputs
 

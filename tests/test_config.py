@@ -13,6 +13,8 @@ def test_smoke_config_loads() -> None:
     assert cfg.model.layer == 3
     assert cfg.proposal.window_size == 10
     assert cfg.proposal.window_sizes == [8, 16, 32]
+    assert cfg.proposal.high_fraction == 0.2
+    assert cfg.proposal.high_reconstruction_weight == 0.2
     assert cfg.proposal.sweep_budget(8) == {
         "window_size": 8,
         "batch_windows": 16,

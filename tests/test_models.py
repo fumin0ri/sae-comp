@@ -49,8 +49,15 @@ def test_transition_jepa_shapes() -> None:
     )
     model = TransitionJEPA(cfg, sae)
     output = model(torch.randn(4, 5, 8))
-    assert output["predicted_codes"].shape == (4, 4, 24)
-    assert output["target_codes"].shape == (4, 4, 24)
+    assert cfg.d_high == 5
+    assert cfg.d_low == 19
+    assert cfg.k_high == 1
+    assert cfg.k_low == 2
+    assert cfg.d_high + cfg.d_low == cfg.d_sae
+    assert cfg.k_high + cfg.k_low == cfg.k
+    assert output["predicted_codes"].shape == (4, 4, 5)
+    assert output["target_codes"].shape == (4, 4, 5)
+    assert output["low_context_codes"].shape == (4, 4, 19)
     assert output["online_target_reconstruction"].shape == (4, 8)
     assert output["target_reconstruction"].shape == (4, 8)
     torch.testing.assert_close(
@@ -73,10 +80,46 @@ def test_transition_jepa_uses_every_context_for_one_endpoint() -> None:
         SparseAutoencoder(sae_cfg),
     )
     output = model(torch.randn(4, 8, 8))
-    assert output["context_codes"].shape == (4, 7, 24)
-    assert output["predicted_codes"].shape == (4, 7, 24)
-    assert output["target_codes"].shape == (4, 7, 24)
+    assert output["context_codes"].shape == (4, 7, 5)
+    assert output["predicted_codes"].shape == (4, 7, 5)
+    assert output["target_codes"].shape == (4, 7, 5)
     assert output["target_residual"].shape == (4, 7, 8)
+    assert bool(
+        ((output["high_codes"] > 0).sum(dim=-1) <= model.cfg.k_high).all()
+    )
+    assert bool(
+        ((output["low_codes"] > 0).sum(dim=-1) <= model.cfg.k_low).all()
+    )
+
+
+def test_high_and_low_reconstruction_are_cumulative() -> None:
+    model = TransitionJEPA(
+        TransitionJEPAConfig(d_in=8, d_sae=20, k=5, window_size=6),
+        SparseAutoencoder(
+            SparseAutoencoderConfig(d_in=8, d_sae=20, k=5)
+        ),
+    )
+    output = model(torch.randn(3, 6, 8))
+    expected = output["online_high_reconstruction"] + model.decode_low(
+        output["online_target_low_code"], ema=False, add_bias=False
+    )
+    torch.testing.assert_close(output["online_target_reconstruction"], expected)
+    assert output["predicted_codes"].shape[-1] == model.cfg.d_high
+
+
+def test_forecast_decoder_cannot_use_low_dictionary_rows() -> None:
+    model = TransitionJEPA(
+        TransitionJEPAConfig(d_in=8, d_sae=20, k=5, window_size=6),
+        SparseAutoencoder(
+            SparseAutoencoderConfig(d_in=8, d_sae=20, k=5)
+        ),
+    )
+    code = torch.randn(2, 3, model.cfg.d_high)
+    before = model.decode_high(code, ema=True, add_bias=False)
+    with torch.no_grad():
+        model.ema_decoder[model.cfg.d_high :].add_(1000)
+    after = model.decode_high(code, ema=True, add_bias=False)
+    torch.testing.assert_close(before, after)
 
 
 def test_ema_update_tracks_full_sae_and_normalizes_decoder() -> None:

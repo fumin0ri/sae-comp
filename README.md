@@ -5,19 +5,24 @@ Standard Top-K SAE、Temporal SAE、提案手法 Transition JEPA-SAE を同一�
 実験コードです。提案手法は `W = 16, 32, 64` の3条件を評価します。
 
 提案手法は `fumin0ri/my-sae` commit
-`bdc0b4183741df4e0ecb62708c95bfc78cf79194` の
-`all_context_fixed_endpoint_ema_sae_v2` を実装しています。窓内の各
-context位置 `k=0,...,W-2` のcodeから、共通の終端 `T=W-1` のEMA codeを
-予測します。最終評価に使うSAEはencoder、decoder、normalization biasを含む
-完全EMA teacherです。
+`945a5aa54ab955064e8ed50cdcaefcc2a71fed16` の
+`hierarchical_high_low_fixed_endpoint_ema_sae_v1` を実装しています。辞書幅と
+Top-K budgetを20% high / 80% lowへ分け、それぞれ独立Top-Kを適用します。窓内の
+各context位置 `k=0,...,W-2` のhigh codeから共通終端 `T=W-1` のEMA high codeを
+予測し、low groupはfull endpoint再構成へdetailを加えます。最終評価にはhigh/low
+分割を保持した完全EMA teacherを使用します。
 
 比較する5条件は次のとおりです。
 
 - Standard Top-K SAE
 - Temporal SAE
-- Transition JEPA-SAE (`W=16`)
-- Transition JEPA-SAE (`W=32`)
-- Transition JEPA-SAE (`W=64`)
+- Hierarchical high/low Transition JEPA-SAE (`W=16`)
+- Hierarchical high/low Transition JEPA-SAE (`W=32`)
+- Hierarchical high/low Transition JEPA-SAE (`W=64`)
+
+最新版upstreamにはunsplit JEPA baselineもありますが、このrepositoryでは指定された
+5条件の比較を維持し、3つのProposal条件をすべて最新版のhierarchical提案法として
+評価します。
 
 SAEBench の `core`、`sparse_probing`、`sparse_probing_sae_probes`、`RAVEL`
 を実行します。TPP と SCR は設定の allowlist から除外しており、指定すると
@@ -100,7 +105,7 @@ residual position数は変わらないため、手法間とW間の比較条件�
 出力先は自動的に次へ分離されます。
 
 ```text
-runs/saebench-pythia160m-deduped-fixed-endpoint-v2-trainx2/
+runs/saebench-pythia160m-deduped-hierarchical-v1-trainx2/
 ```
 
 step数を個別に指定することもできます。
@@ -139,6 +144,9 @@ sae-comp run \
 - branch training: 全条件 6,000 steps
 - proposal residual positions/step: 全Wで512
 - proposal contexts/window: `W-1`（全位置を使用）
+- proposal dictionary: high 20% / low 80%
+- proposal Top-K: high 20% / low 80%へ独立配分
+- proposal reconstruction: high-only FVU 0.2 + full FVU 0.8
 
 Temporal SAE と3つの提案条件は Standard SAE の共通 checkpoint から分岐します。
 提案条件間では共有可能な初期値、optimizer step 数、読み込む residual position
@@ -148,7 +156,7 @@ Wごとに480、496、504/stepです。予測損失は全pairの平均なので�
 ## 出力
 
 ```text
-runs/saebench-pythia160m-deduped-fixed-endpoint-v2/
+runs/saebench-pythia160m-deduped-hierarchical-v1/
   checkpoints/
   saebench_results/
     core/

@@ -1,4 +1,4 @@
-run_dir = "runs/smoke"
+run_dir = "runs/smoke-hierarchical-v1"
 activation_dir = "data/smoke"
 
 [model]
@@ -56,6 +56,8 @@ device = "cuda"
 window_size = 10
 window_sizes = [8, 16, 32]
 sweep_residual_positions_per_step = 128
+high_fraction = 0.2
+high_reconstruction_weight = 0.2
 predictor_width = 64
 predictor_expansion = 2
 predictor_warmup_steps = 5
