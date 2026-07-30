@@ -5,8 +5,10 @@ import math
 from dataclasses import asdict, dataclass
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
+
+PROPOSAL_ARCHITECTURE_ID = "all_context_fixed_endpoint_ema_sae_v2"
 
 
 def token_topk(values: torch.Tensor, k: int) -> torch.Tensor:
@@ -109,13 +111,15 @@ class TransitionJEPAConfig:
     ema_decay: float = 0.996
 
 
-class OffsetConditionedPredictor(nn.Module):
+class PositionConditionedPredictor(nn.Module):
+    """Predict the fixed endpoint code from each context code and position."""
+
     def __init__(self, cfg: TransitionJEPAConfig):
         super().__init__()
         width = cfg.predictor_width
         hidden = cfg.predictor_expansion * width
         self.context_projection = nn.Linear(cfg.d_sae, width, bias=False)
-        self.offset_embedding = nn.Embedding(cfg.window_size, width)
+        self.position_embedding = nn.Embedding(cfg.window_size, width)
         self.mlp = nn.Sequential(
             nn.LayerNorm(width),
             nn.Linear(width, hidden),
@@ -128,71 +132,179 @@ class OffsetConditionedPredictor(nn.Module):
         nn.init.constant_(self.output.bias, -4.0)
 
     def forward(
-        self, context_code: torch.Tensor, offsets: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        state = self.context_projection(context_code)
-        queries = state[:, None, :] + self.offset_embedding(offsets)[None]
-        return F.softplus(self.output(self.mlp(queries))), state
+        self,
+        context_code: torch.Tensor,
+        context_positions: torch.Tensor,
+        use_context: bool = True,
+    ) -> torch.Tensor:
+        if context_code.ndim == 2:
+            context_code = context_code[:, None, :]
+        if context_code.ndim != 3:
+            raise ValueError("context_code must have shape [batch, contexts, d_sae]")
+        if (
+            context_positions.ndim != 1
+            or len(context_positions) != context_code.shape[1]
+        ):
+            raise ValueError(
+                "context_positions must contain one value for each context"
+            )
+        if use_context:
+            state = self.context_projection(context_code)
+        else:
+            state = torch.zeros(
+                (*context_code.shape[:-1], self.context_projection.out_features),
+                device=context_code.device,
+                dtype=context_code.dtype,
+            )
+        queries = state + self.position_embedding(context_positions)[None]
+        return F.softplus(self.output(self.mlp(queries)))
 
 
 class TransitionJEPA(nn.Module):
-    """Offset-conditioned Transition JEPA-SAE from fumin0ri/my-sae."""
+    """Forecast one fixed endpoint from every earlier residual in a window."""
 
     def __init__(self, cfg: TransitionJEPAConfig, initialized_sae: SparseAutoencoder):
         super().__init__()
         self.cfg = cfg
         self.sae = copy.deepcopy(initialized_sae)
-        self.target_encoder = copy.deepcopy(self.sae.encoder)
-        self.predictor = OffsetConditionedPredictor(cfg)
-        for parameter in self.target_encoder.parameters():
+        self.ema_encoder = copy.deepcopy(self.sae.encoder)
+        self.ema_decoder = nn.Parameter(
+            self.sae.decoder.detach().clone(),
+            requires_grad=False,
+        )
+        self.register_buffer("ema_pre_bias", self.sae.pre_bias.detach().clone())
+        self.predictor = PositionConditionedPredictor(cfg)
+        for parameter in self.ema_encoder.parameters():
             parameter.requires_grad_(False)
+        self.normalize_ema_decoder()
 
     def set_sae_trainable(self, trainable: bool) -> None:
         self.sae.pre_bias.requires_grad_(trainable)
         self.sae.decoder.requires_grad_(trainable)
         for parameter in self.sae.encoder.parameters():
             parameter.requires_grad_(trainable)
+        for parameter in self.ema_encoder.parameters():
+            parameter.requires_grad_(False)
+        self.ema_decoder.requires_grad_(False)
 
     @torch.no_grad()
-    def update_target(self) -> None:
+    def update_ema_sae(self, decay: float | None = None) -> None:
+        rate = self.cfg.ema_decay if decay is None else decay
         for target, online in zip(
-            self.target_encoder.parameters(), self.sae.encoder.parameters()
+            self.ema_encoder.parameters(), self.sae.encoder.parameters()
         ):
-            target.mul_(self.cfg.ema_decay).add_(
-                online.detach(), alpha=1 - self.cfg.ema_decay
-            )
+            target.mul_(rate).add_(online.detach(), alpha=1 - rate)
+        self.ema_pre_bias.mul_(rate).add_(
+            self.sae.pre_bias.detach(), alpha=1 - rate
+        )
+        self.ema_decoder.mul_(rate).add_(
+            self.sae.decoder.detach(), alpha=1 - rate
+        )
+        self.normalize_ema_decoder()
 
     @torch.no_grad()
-    def target_codes(self, x: torch.Tensor) -> torch.Tensor:
-        normalized = (x - self.sae.pre_bias.detach()) / self.sae.pre_scale
-        return token_topk(self.target_encoder(normalized), self.cfg.k)
+    def normalize_ema_decoder(self) -> None:
+        self.ema_decoder.div_(
+            self.ema_decoder.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        )
+
+    @torch.no_grad()
+    def encode_ema(self, x: torch.Tensor) -> torch.Tensor:
+        normalized = (x - self.ema_pre_bias) / self.sae.pre_scale
+        return token_topk(self.ema_encoder(normalized), self.cfg.k)
+
+    def decode_ema(self, z: torch.Tensor, add_bias: bool = True) -> torch.Tensor:
+        """Decode with the frozen EMA dictionary while preserving dz gradients."""
+        value = self.sae.pre_scale * (z @ self.ema_decoder)
+        return value + self.ema_pre_bias if add_bias else value
+
+    @torch.no_grad()
+    def final_ema_sae(self) -> SparseAutoencoder:
+        """Export the full EMA teacher as the standalone SAE used downstream."""
+        result = SparseAutoencoder(copy.deepcopy(self.sae.cfg)).to(
+            device=self.ema_decoder.device,
+            dtype=self.ema_decoder.dtype,
+        )
+        result.pre_bias.copy_(self.ema_pre_bias)
+        result.pre_scale.copy_(self.sae.pre_scale)
+        result.encoder.load_state_dict(self.ema_encoder.state_dict())
+        result.decoder.copy_(self.ema_decoder)
+        result.threshold.copy_(self.sae.threshold)
+        return result
+
+    def predict_from_code(
+        self,
+        context_code: torch.Tensor,
+        context_positions: torch.Tensor | None = None,
+        *,
+        use_context: bool = True,
+        sparse_output: bool = False,
+    ) -> torch.Tensor:
+        if context_code.ndim == 2:
+            context_code = context_code[:, None, :]
+        if context_positions is None:
+            if context_code.shape[1] == self.cfg.window_size - 1:
+                context_positions = torch.arange(
+                    self.cfg.window_size - 1,
+                    device=context_code.device,
+                    dtype=torch.long,
+                )
+            elif context_code.shape[1] == 1:
+                context_positions = torch.zeros(
+                    1, device=context_code.device, dtype=torch.long
+                )
+            else:
+                raise ValueError(
+                    "explicit context_positions are required for this shape"
+                )
+        dense = self.predictor(
+            context_code,
+            context_positions.to(device=context_code.device, dtype=torch.long),
+            use_context=use_context,
+        )
+        return token_topk(dense, self.cfg.k) if sparse_output else dense
 
     def forward(
-        self, windows: torch.Tensor, offsets: torch.Tensor | None = None
+        self,
+        windows: torch.Tensor,
+        *,
+        use_context: bool = True,
+        use_ema_context: bool = False,
     ) -> dict[str, torch.Tensor]:
         if windows.ndim != 3 or windows.shape[1] != self.cfg.window_size:
             raise ValueError(f"expected [batch, {self.cfg.window_size}, d_in] windows")
-        if offsets is None:
-            offsets = torch.arange(1, self.cfg.window_size, device=windows.device)
-        if offsets.ndim != 1 or len(offsets) == 0:
-            raise ValueError("offsets must be a non-empty one-dimensional tensor")
-        offsets = offsets.to(device=windows.device, dtype=torch.long)
-        if int(offsets.min()) < 1 or int(offsets.max()) >= self.cfg.window_size:
-            raise ValueError("offsets must lie in [1, window_size)")
         codes = self.sae.encode_token_topk(windows)
-        reconstruction = self.sae.decode(codes)
-        target_residual = windows[:, offsets]
-        targets = self.target_codes(target_residual)
-        prediction, state = self.predictor(codes[:, 0], offsets)
-        sparse_prediction = token_topk(prediction, self.cfg.k)
+        if use_ema_context:
+            with torch.no_grad():
+                context_codes = self.encode_ema(windows[:, :-1])
+        else:
+            context_codes = codes[:, :-1]
+        online_target_code = codes[:, -1]
+        online_target_reconstruction = self.sae.decode(online_target_code)
+        with torch.no_grad():
+            target_code = self.encode_ema(windows[:, -1])
+            target_reconstruction = self.decode_ema(target_code)
+        predicted_codes = self.predict_from_code(
+            context_codes, use_context=use_context
+        )
+        sparse_prediction = token_topk(predicted_codes, self.cfg.k)
+        predictable_residual = self.decode_ema(sparse_prediction)
+        target_codes = target_code[:, None, :].expand_as(predicted_codes)
+        target_residual = windows[:, -1][:, None, :].expand_as(
+            predictable_residual
+        )
         return {
             "codes": codes,
-            "reconstruction": reconstruction,
-            "targets": targets,
-            "prediction": prediction,
-            "sparse_prediction": sparse_prediction,
-            "predicted_residual": self.sae.decode(sparse_prediction),
+            "context_codes": context_codes,
+            "context_code": context_codes[:, 0],
+            "online_target_code": online_target_code,
+            "online_target_reconstruction": online_target_reconstruction,
+            "target_reconstruction": target_reconstruction,
+            "target_code": target_code,
+            "target_codes": target_codes,
+            "predicted_codes": predicted_codes,
+            "sparse_predicted_codes": sparse_prediction,
             "target_residual": target_residual,
-            "offsets": offsets,
-            "state": state,
+            "predictable_residual": predictable_residual,
+            "innovation_residual": target_residual - predictable_residual,
         }

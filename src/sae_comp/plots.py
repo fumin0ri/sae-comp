@@ -151,7 +151,7 @@ def _plot_forecasts(metrics: dict[str, Any], output_dir: Path) -> Path:
     forecasts = metrics["proposal_forecasts"]
     figure, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
     figure.suptitle(
-        "Proposal forecast diagnostics by offset",
+        "Fixed-endpoint forecast diagnostics by horizon",
         fontsize=16,
         fontweight="bold",
     )
@@ -180,7 +180,7 @@ def _plot_forecasts(metrics: dict[str, Any], output_dir: Path) -> Path:
             linewidth=1,
             label="Common comparison horizon",
         )
-        axis.set_xlabel("Forecast offset")
+        axis.set_xlabel("Forecast horizon")
         axis.grid(alpha=0.25)
     axes[0].set_title("Target-code cosine")
     axes[0].set_ylabel("Cosine similarity")
@@ -210,7 +210,10 @@ def _plot_training(cfg: ExperimentConfig, output_dir: Path) -> Path:
         ),
     }
     series.update(
-        {label: (history, "reconstruction_fvu") for label, history in proposals.items()}
+        {
+            label: (history, "online_reconstruction_fvu")
+            for label, history in proposals.items()
+        }
     )
     figure, axis = plt.subplots(figsize=(11, 6), constrained_layout=True)
     for label, (history, metric) in series.items():
@@ -221,7 +224,9 @@ def _plot_training(cfg: ExperimentConfig, output_dir: Path) -> Path:
             linewidth=2,
             label=display_name(label),
         )
-    axis.set_title("Branch training reconstruction FVU", fontsize=16, fontweight="bold")
+    axis.set_title(
+        "Branch training reconstruction FVU", fontsize=16, fontweight="bold"
+    )
     axis.set_xlabel("Optimizer step")
     axis.set_ylabel("FVU (lower is better)")
     axis.grid(alpha=0.25)

@@ -1,4 +1,4 @@
-run_dir = "runs/saebench-pythia160m-deduped"
+run_dir = "runs/saebench-pythia160m-deduped-fixed-endpoint-v2"
 activation_dir = "data/saebench-pythia160m-deduped-layer8"
 
 [model]
@@ -55,16 +55,13 @@ device = "cuda"
 [proposal]
 window_size = 10
 window_sizes = [16, 32, 64]
-sweep_tokens_per_step = 512
-sweep_forecast_pairs_per_step = 448
+sweep_residual_positions_per_step = 512
 predictor_width = 256
 predictor_expansion = 2
 predictor_warmup_steps = 800
 prediction_ramp_steps = 800
 prediction_weight = 1.0
 residual_prediction_weight = 0.1
-variance_weight = 0.01
-variance_target = 1.0
 ema_decay = 0.996
 
 [evaluation]

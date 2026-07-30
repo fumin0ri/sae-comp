@@ -2,10 +2,10 @@
 
 ## Question
 
-Does an offset-conditioned Transition JEPA objective reshape a sparse
-dictionary so that it preserves reconstruction while exposing more
-sequence-level semantic and contextual state than a reconstruction-only SAE
-or a Temporal SAE?
+Does an all-context, fixed-endpoint Transition JEPA objective reshape a sparse
+dictionary so that its final full-EMA SAE preserves reconstruction while
+exposing more sequence-level semantic and contextual state than a
+reconstruction-only SAE or a Temporal SAE?
 
 ## Prespecified primary outcomes
 
@@ -54,10 +54,17 @@ high-level codes. It intentionally uses the paper's cosine objective rather
 than the unnormalized dot-product logits present in one public training
 script.
 
-The proposal predictor receives `z0` and a discrete offset only. It does not
-receive intervening tokens. Its forecast metrics therefore measure the
-forecastable component under the data distribution, not deterministic
-transition accuracy.
+For a window endpoint `T=W-1`, the proposal predictor separately maps every
+earlier code and its absolute context position,
+`P(z_k, position(k))`, to the same stop-gradient full-EMA endpoint code `z_T`.
+It does not pool contexts or receive intervening tokens. The online SAE
+reconstructs only the endpoint. The sparse predicted code is decoded through
+the frozen EMA decoder, and the final downstream artifact is the EMA encoder,
+decoder, and normalization bias. Variance regularization is excluded.
+
+The window sweep fixes optimizer steps and residual positions read per step.
+Because the architecture requires all `W-1` contexts, context-target pair
+counts are reported rather than subsampled to artificial equality.
 
 ## Replication
 

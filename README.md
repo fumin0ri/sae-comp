@@ -4,6 +4,13 @@ Standard Top-K SAE、Temporal SAE、提案手法 Transition JEPA-SAE を同一�
 学習し、[SAEBench](https://github.com/adamkarvonen/SAEBench) v0.6.0 で比較する
 実験コードです。提案手法は `W = 16, 32, 64` の3条件を評価します。
 
+提案手法は `fumin0ri/my-sae` commit
+`bdc0b4183741df4e0ecb62708c95bfc78cf79194` の
+`all_context_fixed_endpoint_ema_sae_v2` を実装しています。窓内の各
+context位置 `k=0,...,W-2` のcodeから、共通の終端 `T=W-1` のEMA codeを
+予測します。最終評価に使うSAEはencoder、decoder、normalization biasを含む
+完全EMA teacherです。
+
 比較する5条件は次のとおりです。
 
 - Standard Top-K SAE
@@ -88,16 +95,18 @@ SAEBench の既存結果は再利用されます。全評価を再計算する�
 - target k: 20
 - shared SAE pretraining: 12,000 steps
 - branch training: 全条件 6,000 steps
-- proposal reconstruction tokens/step: 全Wで512
-- proposal forecast pairs/step: 全Wで448
+- proposal residual positions/step: 全Wで512
+- proposal contexts/window: `W-1`（全位置を使用）
 
 Temporal SAE と3つの提案条件は Standard SAE の共通 checkpoint から分岐します。
-提案条件間では初期値、optimizer step 数、再構成 token 数、予測 pair 数を揃えます。
+提案条件間では共有可能な初期値、optimizer step 数、読み込む residual position
+数を揃えます。全contextを必ず使う新版の定義に従うため、context-target pair数は
+Wごとに480、496、504/stepです。予測損失は全pairの平均なので勾配scaleは揃います。
 
 ## 出力
 
 ```text
-runs/saebench-pythia160m-deduped/
+runs/saebench-pythia160m-deduped-fixed-endpoint-v2/
   checkpoints/
   saebench_results/
     core/

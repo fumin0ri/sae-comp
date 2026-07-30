@@ -15,11 +15,14 @@ from tqdm import trange
 from .activations import ActivationStore, load_manifest
 from .config import ExperimentConfig
 from .models import (
+    PROPOSAL_ARCHITECTURE_ID,
     SparseAutoencoder,
     SparseAutoencoderConfig,
     TransitionJEPA,
     TransitionJEPAConfig,
 )
+
+PROPOSAL_SOURCE_COMMIT = "bdc0b4183741df4e0ecb62708c95bfc78cf79194"
 
 
 def _autocast(device: torch.device, dtype: str):
@@ -74,8 +77,11 @@ def _save_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "format": "sae-comp-checkpoint-v1",
+            "format": "sae-comp-checkpoint-v2",
             "method": method,
+            "architecture_id": (
+                PROPOSAL_ARCHITECTURE_ID if method == "proposal" else None
+            ),
             "state_dict": _state_dict_cpu(module),
             "model_config": model_config,
             "experiment_config": cfg.as_dict(),
@@ -83,7 +89,10 @@ def _save_checkpoint(
             "activation_config_fingerprint": manifest["config_fingerprint"],
             "metadata": metadata or {},
             "source": {
-                "proposal": "https://github.com/fumin0ri/my-sae",
+                "proposal": {
+                    "repository": "https://github.com/fumin0ri/my-sae",
+                    "commit": PROPOSAL_SOURCE_COMMIT,
+                },
                 "temporal": ("https://github.com/AI4LIFE-GROUP/temporal-saes"),
             },
         },
@@ -93,7 +102,10 @@ def _save_checkpoint(
 
 def load_checkpoint(path: str | Path) -> dict[str, Any]:
     value = torch.load(path, map_location="cpu", weights_only=True)
-    if value.get("format") != "sae-comp-checkpoint-v1":
+    if value.get("format") not in {
+        "sae-comp-checkpoint-v1",
+        "sae-comp-checkpoint-v2",
+    }:
         raise ValueError(f"unsupported checkpoint: {path}")
     return value
 
@@ -320,21 +332,32 @@ def _proposal_loss(
     windows: torch.Tensor,
     prediction_weight: float,
     cfg: ExperimentConfig,
-    offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    output = model(windows, offsets)
-    reconstruction = _fvu(output["reconstruction"], windows)
-    prediction = output["prediction"]
-    targets = output["targets"].detach()
+    output = model(windows)
+    endpoint = windows[:, -1]
+    residual_scale = (
+        endpoint - model.sae.pre_bias.detach()
+    ).float().square().mean().clamp_min(1e-8)
+    reconstruction = (
+        output["online_target_reconstruction"] - endpoint
+    ).float().square().mean() / residual_scale
+    ema_residual_scale = (
+        endpoint - model.ema_pre_bias.detach()
+    ).float().square().mean().clamp_min(1e-8)
+    ema_reconstruction = (
+        output["target_reconstruction"] - endpoint
+    ).float().square().mean() / ema_residual_scale
+    prediction = output["predicted_codes"]
+    targets = output["target_codes"].detach()
     cosine = F.cosine_similarity(prediction, targets, dim=-1)
     target_energy = targets.float().square().mean(dim=-1).clamp_min(1e-8)
     normalized_mse = (prediction - targets).float().square().mean(
         dim=-1
     ) / target_energy
     prediction_loss = (1 - cosine + 0.25 * normalized_mse).mean()
-    residual_prediction = _fvu(output["predicted_residual"], output["target_residual"])
-    state_std = output["state"].float().std(dim=0, unbiased=False)
-    variance = F.relu(cfg.proposal.variance_target - state_std).mean()
+    residual_prediction = (
+        output["predictable_residual"] - output["target_residual"]
+    ).float().square().mean() / ema_residual_scale
     loss = (
         reconstruction
         + prediction_weight
@@ -342,17 +365,42 @@ def _proposal_loss(
             prediction_loss
             + cfg.proposal.residual_prediction_weight * residual_prediction
         )
-        + cfg.proposal.variance_weight * variance
     )
-    return loss, {
+    predicted_active = output["sparse_predicted_codes"] > 0
+    target_active = targets > 0
+    intersection = (predicted_active & target_active).sum(dim=-1).float()
+    precision = intersection / predicted_active.sum(dim=-1).float().clamp_min(1)
+    recall = intersection / target_active.sum(dim=-1).float().clamp_min(1)
+    union = (predicted_active | target_active).sum(dim=-1).float().clamp_min(1)
+    metrics = {
         "loss": float(loss.detach()),
-        "reconstruction_fvu": float(reconstruction.detach()),
+        "online_reconstruction_fvu": float(reconstruction.detach()),
+        "ema_reconstruction_fvu": float(ema_reconstruction.detach()),
         "prediction_loss": float(prediction_loss.detach()),
         "code_cosine": float(cosine.mean().detach()),
-        "code_normalized_mse": float(normalized_mse.mean().detach()),
+        "code_nrmse": float(normalized_mse.mean().detach()),
+        "support_precision": float(precision.mean().detach()),
+        "support_recall": float(recall.mean().detach()),
+        "support_jaccard": float((intersection / union).mean().detach()),
         "residual_prediction_fvu": float(residual_prediction.detach()),
-        "variance_loss": float(variance.detach()),
+        "sae_l0": float(
+            (output["codes"] > 0).sum(dim=-1).float().mean().detach()
+        ),
     }
+    target_position = model.cfg.window_size - 1
+    for context_position in range(target_position):
+        horizon = target_position - context_position
+        prefix = f"context_{context_position}_horizon_{horizon}"
+        metrics[f"{prefix}_cosine"] = float(
+            cosine[:, context_position].mean().detach()
+        )
+        metrics[f"{prefix}_nrmse"] = float(
+            normalized_mse[:, context_position].mean().detach()
+        )
+        metrics[f"{prefix}_support_recall"] = float(
+            recall[:, context_position].mean().detach()
+        )
+    return loss, metrics
 
 
 def _train_proposal(
@@ -361,7 +409,6 @@ def _train_proposal(
     cfg: ExperimentConfig,
     *,
     window_batch_size: int | None = None,
-    forecast_pairs_per_step: int | None = None,
     minimum_sequence_length: int | None = None,
     description: str = "transition JEPA",
 ) -> list[dict[str, float | int | str]]:
@@ -372,17 +419,6 @@ def _train_proposal(
         model.cfg.window_size,
         minimum_sequence_length=minimum_sequence_length,
     )
-    offsets_per_window: int | None = None
-    offset_generator: torch.Generator | None = None
-    if forecast_pairs_per_step is not None:
-        if forecast_pairs_per_step % batch_size:
-            raise ValueError("forecast_pairs_per_step must be divisible by batch size")
-        offsets_per_window = forecast_pairs_per_step // batch_size
-        if not 1 <= offsets_per_window < model.cfg.window_size:
-            raise ValueError("invalid number of forecast offsets per window")
-        offset_generator = torch.Generator(device=device).manual_seed(
-            cfg.train.seed + 3
-        )
     model.set_sae_trainable(False)
     optimizer = torch.optim.AdamW(
         [
@@ -429,23 +465,9 @@ def _train_proposal(
                 joint_step / max(cfg.proposal.prediction_ramp_steps, 1),
             )
         windows = next(iterator).to(device, non_blocking=True)
-        offsets = None
-        if offsets_per_window is not None:
-            offsets = (
-                torch.randperm(
-                    model.cfg.window_size - 1,
-                    generator=offset_generator,
-                    device=device,
-                )[:offsets_per_window]
-                .sort()
-                .values
-                + 1
-            )
         optimizer.zero_grad(set_to_none=True)
         with _autocast(device, cfg.train.amp_dtype):
-            loss, metrics = _proposal_loss(
-                model, windows, prediction_weight, cfg, offsets
-            )
+            loss, metrics = _proposal_loss(model, windows, prediction_weight, cfg)
         loss.backward()
         if phase == "joint":
             _project_decoder_gradient(model.sae)
@@ -456,7 +478,7 @@ def _train_proposal(
         optimizer.step()
         if phase == "joint":
             model.sae.normalize_decoder()
-            model.update_target()
+            model.update_ema_sae()
         if (
             step == 1
             or step % cfg.train.log_every == 0
@@ -469,14 +491,10 @@ def _train_proposal(
                     "prediction_weight": prediction_weight,
                     "window_size": model.cfg.window_size,
                     "batch_windows": batch_size,
-                    "reconstruction_tokens": batch_size * model.cfg.window_size,
-                    "forecast_pairs": (
-                        batch_size
-                        * (
-                            offsets_per_window
-                            if offsets_per_window is not None
-                            else model.cfg.window_size - 1
-                        )
+                    "residual_positions": batch_size * model.cfg.window_size,
+                    "endpoint_reconstructions": batch_size,
+                    "context_target_pairs": (
+                        batch_size * (model.cfg.window_size - 1)
                     ),
                     **metrics,
                 }
@@ -780,7 +798,7 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
             source = template_state[name]
             if source.shape == target.shape:
                 target.copy_(source)
-            elif name == "predictor.offset_embedding.weight":
+            elif name == "predictor.position_embedding.weight":
                 target.copy_(source[:window_size])
             else:
                 raise ValueError(f"cannot share sweep initialization for {name}")
@@ -792,18 +810,21 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
             ActivationStore(manifest_path, cfg.train.seed + 100),
             cfg,
             window_batch_size=budget["batch_windows"],
-            forecast_pairs_per_step=budget["forecast_pairs_per_step"],
             minimum_sequence_length=maximum_window,
             description=f"transition JEPA W={window_size}",
         )
         budget_record = {
             **budget,
             "optimizer_steps": cfg.train.branch_steps,
-            "total_reconstruction_tokens": (
-                budget["reconstruction_tokens_per_step"] * cfg.train.branch_steps
+            "total_residual_positions": (
+                budget["residual_positions_per_step"] * cfg.train.branch_steps
             ),
-            "total_forecast_pairs": (
-                budget["forecast_pairs_per_step"] * cfg.train.branch_steps
+            "total_endpoint_reconstructions": (
+                budget["endpoint_reconstructions_per_step"]
+                * cfg.train.branch_steps
+            ),
+            "total_context_target_pairs": (
+                budget["context_target_pairs_per_step"] * cfg.train.branch_steps
             ),
             "minimum_sequence_length": maximum_window,
         }
@@ -816,7 +837,9 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
             asdict(proposal_cfg),
             cfg,
             manifest,
-            metadata={"window_sweep_budget": budget_record},
+            metadata={
+                "window_sweep_budget": budget_record,
+            },
         )
         paths[label] = path
         del proposal

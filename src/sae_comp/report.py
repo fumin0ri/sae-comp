@@ -106,13 +106,16 @@ def build_window_sweep_report(cfg: ExperimentConfig) -> Path:
         "# Proposal window-width sweep",
         "",
         "Every condition uses the same shared SAE initialization, optimizer-step "
-        "count, reconstruction-token count, forecast-pair count, and pool of "
-        f"sequences with at least {max(cfg.proposal.window_sizes)} valid tokens.",
+        "count, residual-position count, and pool of sequences with at least "
+        f"{max(cfg.proposal.window_sizes)} valid tokens. The new architecture "
+        "uses every context position, so context-target pair counts are reported "
+        "rather than artificially subsampled to equality.",
         "",
-        "| W | Batch windows | Forecast offsets/window | Total reconstruction tokens | "
-        "Total forecast pairs | FVE | Cosine | Alive | L0 | Forecast cosine (1..7) | "
+        "| W | Batch windows | Contexts/window | Total residual positions | "
+        "Total endpoint reconstructions | Total context-target pairs | FVE | "
+        "Cosine | Alive | L0 | Forecast cosine (h=1..7) | "
         "True-shuffled (1..7) |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for window_size in cfg.proposal.window_sizes:
         label = f"proposal_w{window_size:03d}"
@@ -126,9 +129,10 @@ def build_window_sweep_report(cfg: ExperimentConfig) -> Path:
                 [
                     str(window_size),
                     str(budget["batch_windows"]),
-                    str(budget["forecast_offsets_per_window"]),
-                    str(budget["total_reconstruction_tokens"]),
-                    str(budget["total_forecast_pairs"]),
+                    str(budget["context_positions_per_window"]),
+                    str(budget["total_residual_positions"]),
+                    str(budget["total_endpoint_reconstructions"]),
+                    str(budget["total_context_target_pairs"]),
                     _number(common["fve"]),
                     _number(common["cosine_similarity"]),
                     _number(common["fraction_alive"]),
@@ -159,8 +163,9 @@ def build_window_sweep_report(cfg: ExperimentConfig) -> Path:
     lines.extend(
         [
             "",
-            "The table compares the common forecast horizon (offsets 1..7). "
-            "All-offset means and offset-wise results are retained in "
+            "The table compares the common forecast horizons 1..7, where "
+            "`h = (W - 1) - context_position`. All-horizon means and "
+            "position-wise results are retained in "
             "`evaluation/window_sweep.json`.",
             "",
         ]
@@ -211,31 +216,30 @@ def build_controlled_report(cfg: ExperimentConfig) -> Path:
         "Temporal SAE paper's principal Pythia setup. Standard and proposal "
         "conditions use token-wise Top-K; Temporal SAE uses BatchTopK training.",
         "",
-        "## Equal branch-training budget",
+        "## Controlled branch-training budget",
         "",
-        "| Method | Windows/step | Reconstruction tokens/step | Temporal pairs/step | "
-        "Total reconstruction tokens | Total temporal pairs |",
+        "| Method | Windows/step | Residual positions/step | Reconstruction "
+        "targets/step | Predictive pairs/step | Total residual positions |",
         "|---|---:|---:|---:|---:|---:|",
     ]
     total_tokens = experiment["total_reconstruction_tokens_per_method"]
-    total_pairs = experiment["total_temporal_pairs_per_temporal_method"]
     lines.extend(
         [
-            f"| Standard Top-K | - | {cfg.train.token_batch_size} | - | "
-            f"{total_tokens:,} | - |",
+            f"| Standard Top-K | - | {cfg.train.token_batch_size} | "
+            f"{cfg.train.token_batch_size} | - | {total_tokens:,} |",
             f"| Temporal SAE | - | {cfg.train.token_batch_size} | "
-            f"{cfg.train.temporal_pairs_per_step} | {total_tokens:,} | "
-            f"{total_pairs:,} |",
+            f"{cfg.train.token_batch_size} | {cfg.train.temporal_pairs_per_step} | "
+            f"{total_tokens:,} |",
         ]
     )
     for window_size in cfg.proposal.window_sizes:
-        budget = cfg.proposal.sweep_budget(window_size)
-        lines.append(
-            f"| Proposal W={window_size} | {budget['batch_windows']} | "
-            f"{budget['reconstruction_tokens_per_step']} | "
-            f"{budget['forecast_pairs_per_step']} | {total_tokens:,} | "
-            f"{total_pairs:,} |"
-        )
+            budget = cfg.proposal.sweep_budget(window_size)
+            lines.append(
+                f"| Proposal W={window_size} | {budget['batch_windows']} | "
+                f"{budget['residual_positions_per_step']} | "
+                f"{budget['endpoint_reconstructions_per_step']} | "
+                f"{budget['context_target_pairs_per_step']} | {total_tokens:,} |"
+            )
     lines.extend(
         [
             "",
@@ -281,7 +285,7 @@ def build_controlled_report(cfg: ExperimentConfig) -> Path:
             "",
             "## Proposal forecast diagnostic",
             "",
-            f"All proposal means below use the common offset range 1.."
+            f"All proposal means below use the common forecast-horizon range 1.."
             f"{min(cfg.proposal.window_sizes) - 1}.",
             "",
             "| Method | Target-code cosine | True minus shuffled cosine |",

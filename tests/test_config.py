@@ -4,7 +4,6 @@ import pytest
 
 from sae_comp.config import load_config
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -16,9 +15,10 @@ def test_smoke_config_loads() -> None:
     assert cfg.proposal.sweep_budget(8) == {
         "window_size": 8,
         "batch_windows": 16,
-        "reconstruction_tokens_per_step": 128,
-        "forecast_offsets_per_window": 7,
-        "forecast_pairs_per_step": 112,
+        "residual_positions_per_step": 128,
+        "endpoint_reconstructions_per_step": 16,
+        "context_positions_per_window": 7,
+        "context_target_pairs_per_step": 112,
     }
     assert cfg.sae.dictionary_size == 2048
     assert len(cfg.fingerprint()) == 64
@@ -41,11 +41,20 @@ def test_controlled_sweep_has_equal_training_volume() -> None:
     ]
     assert cfg.proposal.window_sizes == [16, 32, 64]
     assert [item["batch_windows"] for item in budgets] == [32, 16, 8]
-    assert [item["forecast_offsets_per_window"] for item in budgets] == [
-        14,
-        28,
-        56,
+    assert [item["context_positions_per_window"] for item in budgets] == [
+        15,
+        31,
+        63,
     ]
-    assert {item["reconstruction_tokens_per_step"] for item in budgets} == {512}
-    assert {item["forecast_pairs_per_step"] for item in budgets} == {448}
+    assert {item["residual_positions_per_step"] for item in budgets} == {512}
+    assert [item["endpoint_reconstructions_per_step"] for item in budgets] == [
+        32,
+        16,
+        8,
+    ]
+    assert [item["context_target_pairs_per_step"] for item in budgets] == [
+        480,
+        496,
+        504,
+    ]
     assert cfg.train.temporal_pairs_per_step == 448

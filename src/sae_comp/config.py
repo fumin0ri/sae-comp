@@ -71,40 +71,29 @@ class TrainConfig:
 class ProposalConfig:
     window_size: int = 10
     window_sizes: tuple[int, ...] = (8, 16, 32, 64, 128)
-    sweep_tokens_per_step: int = 512
-    sweep_forecast_pairs_per_step: int = 448
+    sweep_residual_positions_per_step: int = 512
     predictor_width: int = 256
     predictor_expansion: int = 2
     predictor_warmup_steps: int = 800
     prediction_ramp_steps: int = 800
     prediction_weight: float = 1.0
     residual_prediction_weight: float = 0.1
-    variance_weight: float = 0.01
-    variance_target: float = 1.0
     ema_decay: float = 0.996
 
     def sweep_budget(self, window_size: int) -> dict[str, int]:
-        if self.sweep_tokens_per_step % window_size:
+        if self.sweep_residual_positions_per_step % window_size:
             raise ValueError(
-                "sweep_tokens_per_step must be divisible by every proposal window size"
+                "sweep_residual_positions_per_step must be divisible by every "
+                "proposal window size"
             )
-        batch_windows = self.sweep_tokens_per_step // window_size
-        if self.sweep_forecast_pairs_per_step % batch_windows:
-            raise ValueError(
-                "sweep_forecast_pairs_per_step must be divisible by batch windows"
-            )
-        offsets_per_window = self.sweep_forecast_pairs_per_step // batch_windows
-        if not 1 <= offsets_per_window < window_size:
-            raise ValueError(
-                "sweep forecast budget must sample between 1 and window_size - 1 "
-                "offsets per window"
-            )
+        batch_windows = self.sweep_residual_positions_per_step // window_size
         return {
             "window_size": window_size,
             "batch_windows": batch_windows,
-            "reconstruction_tokens_per_step": self.sweep_tokens_per_step,
-            "forecast_offsets_per_window": offsets_per_window,
-            "forecast_pairs_per_step": self.sweep_forecast_pairs_per_step,
+            "residual_positions_per_step": self.sweep_residual_positions_per_step,
+            "endpoint_reconstructions_per_step": batch_windows,
+            "context_positions_per_window": window_size - 1,
+            "context_target_pairs_per_step": batch_windows * (window_size - 1),
         }
 
 

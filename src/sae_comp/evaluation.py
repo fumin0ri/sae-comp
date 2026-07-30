@@ -12,6 +12,7 @@ from tqdm import tqdm
 from .activations import ActivationStore
 from .config import ExperimentConfig
 from .models import (
+    PROPOSAL_ARCHITECTURE_ID,
     SparseAutoencoder,
     SparseAutoencoderConfig,
     TransitionJEPA,
@@ -27,6 +28,12 @@ def load_method(
     method = checkpoint["method"]
     raw = checkpoint["model_config"]
     if method == "proposal":
+        architecture_id = checkpoint.get("architecture_id")
+        if architecture_id != PROPOSAL_ARCHITECTURE_ID:
+            raise ValueError(
+                "proposal checkpoint uses an obsolete architecture; rerun "
+                "`sae-comp train-window-sweep` with the current code"
+            )
         proposal_cfg = TransitionJEPAConfig(**raw)
         sae_cfg = SparseAutoencoderConfig(
             d_in=proposal_cfg.d_in,
@@ -38,7 +45,9 @@ def load_method(
         proposal = TransitionJEPA(proposal_cfg, initialized).to(device)
         proposal.load_state_dict(checkpoint["state_dict"])
         proposal.eval()
-        return proposal.sae, proposal, method
+        final_sae = proposal.final_ema_sae()
+        final_sae.eval()
+        return final_sae, proposal, method
     sae_cfg = SparseAutoencoderConfig(**raw)
     sae = SparseAutoencoder(sae_cfg).to(device)
     sae.load_state_dict(checkpoint["state_dict"])
@@ -215,10 +224,10 @@ def evaluate_proposal_forecast(
     if proposal is None:
         raise ValueError("proposal forecast requires a proposal checkpoint")
     store = ActivationStore(Path(cfg.activation_dir) / "manifest.json", cfg.train.seed)
-    offsets = proposal.cfg.window_size - 1
-    cosine_sum = torch.zeros(offsets, device=device)
-    shuffled_sum = torch.zeros(offsets, device=device)
-    normalized_mse_sum = torch.zeros(offsets, device=device)
+    contexts = proposal.cfg.window_size - 1
+    cosine_sum = torch.zeros(contexts, device=device)
+    shuffled_sum = torch.zeros(contexts, device=device)
+    normalized_mse_sum = torch.zeros(contexts, device=device)
     count = 0
     for shard in store.validation_shards():
         activations = shard["activations"]
@@ -238,15 +247,18 @@ def evaluate_proposal_forecast(
             batch = torch.stack(
                 windows[start : start + cfg.train.window_batch_size]
             ).to(device)
-            output = proposal(batch)
-            targets = output["targets"]
-            prediction = output["prediction"]
-            context = output["codes"][:, 0]
+            output = proposal(batch, use_ema_context=True)
+            targets = output["target_codes"]
+            prediction = output["predicted_codes"]
+            context = output["context_codes"]
             permutation = torch.roll(
                 torch.arange(len(context), device=device), shifts=1
             )
-            offset_ids = torch.arange(1, proposal.cfg.window_size, device=device)
-            shuffled, _ = proposal.predictor(context[permutation], offset_ids)
+            context_positions = torch.arange(contexts, device=device)
+            shuffled = proposal.predict_from_code(
+                context[permutation],
+                context_positions=context_positions,
+            )
             cosine_sum += F.cosine_similarity(prediction, targets, dim=-1).sum(dim=0)
             shuffled_sum += F.cosine_similarity(shuffled, targets, dim=-1).sum(dim=0)
             energy = targets.float().square().mean(dim=-1).clamp_min(1e-8)
@@ -266,13 +278,17 @@ def evaluate_proposal_forecast(
         "windows": count,
         "offsets": [
             {
-                "offset": index + 1,
-                "code_cosine": float(cosine[index]),
-                "shuffled_code_cosine": float(shuffled[index]),
-                "true_minus_shuffled": float(cosine[index] - shuffled[index]),
-                "normalized_mse": float(normalized_mse[index]),
+                "offset": horizon,
+                "horizon": horizon,
+                "context_position": contexts - horizon,
+                "code_cosine": float(cosine[contexts - horizon]),
+                "shuffled_code_cosine": float(shuffled[contexts - horizon]),
+                "true_minus_shuffled": float(
+                    cosine[contexts - horizon] - shuffled[contexts - horizon]
+                ),
+                "normalized_mse": float(normalized_mse[contexts - horizon]),
             }
-            for index in range(offsets)
+            for horizon in range(1, contexts + 1)
         ],
         "mean_code_cosine": float(cosine.mean()),
         "mean_true_minus_shuffled": float((cosine - shuffled).mean()),
@@ -357,11 +373,16 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
             "training_budget": {
                 **budget,
                 "optimizer_steps": cfg.train.branch_steps,
-                "total_reconstruction_tokens": (
-                    budget["reconstruction_tokens_per_step"] * cfg.train.branch_steps
+                "total_residual_positions": (
+                    budget["residual_positions_per_step"] * cfg.train.branch_steps
                 ),
-                "total_forecast_pairs": (
-                    budget["forecast_pairs_per_step"] * cfg.train.branch_steps
+                "total_endpoint_reconstructions": (
+                    budget["endpoint_reconstructions_per_step"]
+                    * cfg.train.branch_steps
+                ),
+                "total_context_target_pairs": (
+                    budget["context_target_pairs_per_step"]
+                    * cfg.train.branch_steps
                 ),
             },
             "common": evaluate_method(path, cfg),
@@ -381,8 +402,9 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
             "window_size",
             "batch_windows",
             "optimizer_steps",
-            "total_reconstruction_tokens",
-            "total_forecast_pairs",
+            "total_residual_positions",
+            "total_endpoint_reconstructions",
+            "total_context_target_pairs",
             "fve",
             "cosine_similarity",
             "fraction_alive",
@@ -407,10 +429,15 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
                     "window_size": values["window_size"],
                     "batch_windows": budget["batch_windows"],
                     "optimizer_steps": budget["optimizer_steps"],
-                    "total_reconstruction_tokens": budget[
-                        "total_reconstruction_tokens"
+                    "total_residual_positions": budget[
+                        "total_residual_positions"
                     ],
-                    "total_forecast_pairs": budget["total_forecast_pairs"],
+                    "total_endpoint_reconstructions": budget[
+                        "total_endpoint_reconstructions"
+                    ],
+                    "total_context_target_pairs": budget[
+                        "total_context_target_pairs"
+                    ],
                     "fve": common["fve"],
                     "cosine_similarity": common["cosine_similarity"],
                     "fraction_alive": common["fraction_alive"],

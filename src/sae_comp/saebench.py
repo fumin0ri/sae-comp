@@ -129,7 +129,10 @@ def checkpoint_to_saebench(
     architecture = {
         "standard": "standard-topk",
         "temporal": "temporal-batchtopk",
-        "proposal": f"transition-jepa-{label.removeprefix('proposal_')}",
+        "proposal": (
+            "transition-jepa-fixed-endpoint-full-ema-"
+            f"{label.removeprefix('proposal_')}"
+        ),
     }[method]
     activation_fn = "threshold" if method == "temporal" else "topk"
     training_tokens = (

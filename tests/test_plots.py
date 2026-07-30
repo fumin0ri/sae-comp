@@ -105,9 +105,9 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
         json.dumps(
             {
                 "histories": {
-                    label: [
-                        {"step": 1, "reconstruction_fvu": 0.9},
-                        {"step": 2, "reconstruction_fvu": 0.8},
+                        label: [
+                            {"step": 1, "online_reconstruction_fvu": 0.9},
+                            {"step": 2, "online_reconstruction_fvu": 0.8},
                     ]
                     for label in labels
                     if label.startswith("proposal")

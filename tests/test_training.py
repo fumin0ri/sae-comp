@@ -49,7 +49,7 @@ def test_temporal_loss_can_match_pair_budget() -> None:
     assert metrics["l0"] == 4
 
 
-def test_proposal_loss_supports_budgeted_offsets() -> None:
+def test_proposal_loss_uses_fixed_endpoint_and_all_contexts() -> None:
     cfg = ExperimentConfig()
     sae = SparseAutoencoder(SparseAutoencoderConfig(d_in=12, d_sae=40, k=4))
     proposal = TransitionJEPA(
@@ -67,10 +67,38 @@ def test_proposal_loss_supports_budgeted_offsets() -> None:
         torch.randn(4, 8, 12),
         prediction_weight=1.0,
         cfg=cfg,
-        offsets=torch.tensor([1, 3, 7]),
     )
     assert torch.isfinite(loss)
     assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+    assert "online_reconstruction_fvu" in metrics
+    assert "ema_reconstruction_fvu" in metrics
+    assert "variance_loss" not in metrics
+    assert all(
+        f"context_{position}_horizon_{7 - position}_cosine" in metrics
+        for position in range(7)
+    )
+
+
+def test_proposal_loss_does_not_backpropagate_into_ema_teacher() -> None:
+    cfg = ExperimentConfig()
+    proposal = TransitionJEPA(
+        TransitionJEPAConfig(
+            d_in=12,
+            d_sae=40,
+            k=4,
+            window_size=8,
+            predictor_width=16,
+        ),
+        SparseAutoencoder(SparseAutoencoderConfig(d_in=12, d_sae=40, k=4)),
+    )
+    loss, _ = _proposal_loss(
+        proposal, torch.randn(4, 8, 12), prediction_weight=1.0, cfg=cfg
+    )
+    loss.backward()
+    assert proposal.sae.decoder.grad is not None
+    assert proposal.predictor.output.weight.grad is not None
+    assert proposal.ema_decoder.grad is None
+    assert all(p.grad is None for p in proposal.ema_encoder.parameters())
 
 
 def test_checkpoint_round_trip(tmp_path) -> None:
