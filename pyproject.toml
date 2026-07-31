@@ -15,7 +15,7 @@ dependencies = [
   "numpy>=1.26,<3",
   "scipy>=1.11,<2",
   "scikit-learn>=1.4,<2",
-  "torch==2.5.1",
+  "torch==2.7.1",
   "tqdm>=4.66",
   "transformers>=4.44,<5",
 ]
@@ -28,6 +28,10 @@ probe = [
 ]
 saebench = [
   "sae-bench==0.6.0",
+  "sae-lens==6.28.0",
+  "sae-probes==0.4.0",
+  "transformer-lens==2.16.1",
+  "torchvision==0.22.1",
 ]
 dev = ["pytest>=8", "ruff>=0.9"]
 

@@ -43,6 +43,8 @@ interfaceに変換し、
 `sparse_probing_sae_probes`、`RAVEL` です。TPP と SCR は実行しません。
 
 ```bash
-python -m pip install --upgrade -e '.[saebench]'
+python -m pip install --upgrade \
+  -c constraints/saebench-cu128.txt \
+  -e '.[saebench]'
 bash scripts/run_controlled.sh
 ```

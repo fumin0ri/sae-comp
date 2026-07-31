@@ -39,21 +39,31 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install \
-  torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
-  --index-url https://download.pytorch.org/whl/cu124
-python -m pip install -e '.[saebench]'
+  torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+  --index-url https://download.pytorch.org/whl/cu128
+python -m pip install \
+  -c constraints/saebench-cu128.txt \
+  -e '.[saebench]'
+python -m pip check
 python -m sae_comp.cuda_check
 ```
 
-PyTorch は `2.5.1` に固定しています。`pip install --upgrade` などで CUDA 13
-向け wheel に置き換わった場合、CUDA 12.x driver では初期化できません。修復には
-次を実行してください。
+SAEBench 0.6.0 が使用する TransformerLens 2.16.1 は Python 3.11 で
+`torch>=2.6` を要求するため、PyTorch は `2.7.1` に固定しています。RTX 4090機の
+CUDA 12.8 driverに対応するcu128 wheelを先に導入し、その後に制約ファイルを
+適用してください。制約なしの `pip install -e '.[saebench]'` はSAEBenchの広い
+依存範囲を長時間backtrackし、`resolution-too-deep` になることがあります。
+
+既存環境を修復する場合も同じ順序で実行します。
 
 ```bash
 python -m pip install --force-reinstall \
-  torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
-  --index-url https://download.pytorch.org/whl/cu124
-python -m pip install -e '.[saebench]'
+  torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 \
+  --index-url https://download.pytorch.org/whl/cu128
+python -m pip install \
+  -c constraints/saebench-cu128.txt \
+  -e '.[saebench]'
+python -m pip check
 python -m sae_comp.cuda_check
 ```
 

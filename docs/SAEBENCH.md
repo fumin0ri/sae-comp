@@ -7,6 +7,12 @@ API drift による結果差を避けるため、`sae-bench==0.6.0` に固定し
 `EleutherAI/pythia-160m-deduped` です。TransformerLens 側の model name は
 `pythia-160m-deduped`、hook は `blocks.8.hook_resid_post` です。
 
+Python 3.11ではTransformerLens 2.16.1が`torch>=2.6`を要求します。依存解決には
+repositoryの`constraints/saebench-cu128.txt`を使用し、PyTorch 2.7.1 /
+torchvision 0.22.1のcu128 wheelとSAEBench依存を固定します。これによりpipが
+互換性のないTransformerLens、SAE Lens、torchvisionの組み合わせをbacktrack
+し続けることを防ぎます。
+
 ## Included evaluations
 
 - `core`: reconstruction、CE loss preservation、sparsity、feature statistics

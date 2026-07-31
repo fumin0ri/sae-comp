@@ -8,7 +8,7 @@ def test_cuda_preflight_failure_prints_repair_command(
 ) -> None:
     monkeypatch.setattr(cuda_check.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(cuda_check, "_nvidia_smi", lambda: "RTX 4090, 570.00")
-    with pytest.raises(SystemExit, match="torch==2.5.1"):
+    with pytest.raises(SystemExit, match="torch==2.7.1"):
         cuda_check.main()
     output = capsys.readouterr().out
     assert "CUDA preflight:" in output
