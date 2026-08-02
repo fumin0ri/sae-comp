@@ -1,5 +1,5 @@
-run_dir = "runs/saebench-pythia160m-deduped-hierarchical-v1"
-activation_dir = "data/saebench-pythia160m-deduped-layer8"
+run_dir = "runs/saebench-pythia160m-deduped-random-pair-v3"
+activation_dir = "data/saebench-pythia160m-deduped-layer8-long-v2"
 
 [model]
 name = "EleutherAI/pythia-160m-deduped"
@@ -15,6 +15,7 @@ split = "train"
 text_field = "text"
 sequence_length = 128
 min_valid_tokens = 32
+burn_in_tokens = 16
 train_sequences = 40960
 validation_sequences = 1024
 shard_sequences = 256
@@ -44,7 +45,7 @@ window_batch_size = 32
 gradient_accumulation_steps = 1
 standard_lr = 0.0002
 temporal_lr = 0.0002
-proposal_sae_lr = 0.0001
+proposal_sae_lr = 0.0002
 proposal_predictor_lr = 0.0003
 warmup_steps = 500
 gradient_clip = 1.0
@@ -53,17 +54,18 @@ amp_dtype = "bfloat16"
 device = "cuda"
 
 [proposal]
-window_size = 10
-window_sizes = [16, 32, 64]
-sweep_residual_positions_per_step = 512
+window_size = 16
+window_sizes = [2, 4, 8, 16]
+min_span_length = 2
+sweep_pairs_per_step = 512
 high_fraction = 0.2
 high_reconstruction_weight = 0.2
 predictor_width = 256
 predictor_expansion = 2
-predictor_warmup_steps = 800
-prediction_ramp_steps = 800
+sae_warmup_steps = 2000
+prediction_ramp_steps = 1000
 prediction_weight = 1.0
-residual_prediction_weight = 0.1
+horizon_weighting = "inverse_probability"
 ema_decay = 0.996
 
 [evaluation]

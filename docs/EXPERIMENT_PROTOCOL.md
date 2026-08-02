@@ -2,7 +2,7 @@
 
 ## Question
 
-Does a T-SAE-inspired high/low fixed-endpoint JEPA objective separate a
+Does a high/low random-pair horizon JEPA objective separate a
 forecastable high-level state from low-level endpoint detail while its final
 full-EMA SAE preserves reconstruction better than a reconstruction-only SAE
 or a Temporal SAE?
@@ -55,24 +55,26 @@ high-level codes. It intentionally uses the paper's cosine objective rather
 than the unnormalized dot-product logits present in one public training
 script.
 
-For endpoint `T=W-1`, the proposal maps every earlier high code and its
-position, `P(z_high_k, position(k))`, to the same stop-gradient EMA high code
-`z_high_T`. The high block reconstructs the endpoint alone and is the only
-forecast-supervised block. The low block receives gradients through cumulative
-full reconstruction only:
+Long document-disjoint residual sequences are stored before training. For each
+sample, draw `L~Uniform(2,W)`, a boundary-safe endpoint `t`, and one non-endpoint
+context `k` uniformly from the span. The predictor maps
+`P(E_online(x_k)_high, h=t-k)` to the stop-gradient EMA endpoint high code.
+The high block reconstructs the endpoint alone and is the only forecast-supervised
+block. The low block receives gradients through cumulative full reconstruction only:
 
 ```text
-Lrec = 0.2 * FVU(Dhigh(zhigh), hT)
-     + 0.8 * FVU(Dhigh(zhigh) + Dlow(zlow), hT)
+Lrec = 0.2 * FVU(Dhigh(zhigh_t), x_t)
+     + 0.8 * FVU(Dhigh(zhigh_t) + Dlow(zlow_t), x_t)
 ```
 
-The predicted high code is decoded through the frozen EMA high decoder. The
-entire online high/low SAE is EMA-updated and the final artifact retains both
-groups. Variance regularization is excluded.
+The predicted high code is decoded through the frozen EMA high decoder only for
+evaluation; predicted-residual error is not a training loss. The entire online
+high/low SAE is EMA-updated and the final artifact retains both groups.
 
-The window sweep fixes optimizer steps and residual positions read per step.
-Because the architecture requires all `W-1` contexts, context-target pair
-counts are reported rather than subsampled to artificial equality.
+The maximum-span sweep fixes optimizer steps, sampled pairs, and endpoint
+reconstructions per step. Since uniform span then uniform context sampling makes
+short horizons more frequent, each per-sample latent loss is weighted by
+`1 / ((W-1)P(h))`; every supported horizon has equal expected loss mass.
 
 ## Replication
 

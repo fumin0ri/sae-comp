@@ -48,26 +48,27 @@ def test_transition_jepa_shapes() -> None:
         predictor_width=10,
     )
     model = TransitionJEPA(cfg, sae)
-    output = model(torch.randn(4, 5, 8))
+    output = model(
+        torch.randn(4, 8),
+        torch.randn(4, 8),
+        torch.tensor([1, 2, 3, 4]),
+    )
     assert cfg.d_high == 5
     assert cfg.d_low == 19
     assert cfg.k_high == 1
     assert cfg.k_low == 2
     assert cfg.d_high + cfg.d_low == cfg.d_sae
     assert cfg.k_high + cfg.k_low == cfg.k
-    assert output["predicted_codes"].shape == (4, 4, 5)
-    assert output["target_codes"].shape == (4, 4, 5)
-    assert output["low_context_codes"].shape == (4, 4, 19)
+    assert output["predicted_codes"].shape == (4, 5)
+    assert output["target_codes"].shape == (4, 5)
+    assert output["low_context_codes"].shape == (4, 19)
     assert output["online_target_reconstruction"].shape == (4, 8)
     assert output["target_reconstruction"].shape == (4, 8)
-    torch.testing.assert_close(
-        output["target_codes"],
-        output["target_code"][:, None].expand(-1, 4, -1),
-    )
+    torch.testing.assert_close(output["target_codes"], output["target_code"])
     assert not output["target_codes"].requires_grad
 
 
-def test_transition_jepa_uses_every_context_for_one_endpoint() -> None:
+def test_transition_jepa_uses_explicit_per_sample_horizon() -> None:
     sae_cfg = SparseAutoencoderConfig(d_in=8, d_sae=24, k=3)
     model = TransitionJEPA(
         TransitionJEPAConfig(
@@ -79,11 +80,13 @@ def test_transition_jepa_uses_every_context_for_one_endpoint() -> None:
         ),
         SparseAutoencoder(sae_cfg),
     )
-    output = model(torch.randn(4, 8, 8))
-    assert output["context_codes"].shape == (4, 7, 5)
-    assert output["predicted_codes"].shape == (4, 7, 5)
-    assert output["target_codes"].shape == (4, 7, 5)
-    assert output["target_residual"].shape == (4, 7, 8)
+    context = torch.randn(4, 8)
+    target = torch.randn(4, 8)
+    output = model(context, target, torch.tensor([1, 3, 5, 7]))
+    assert output["context_codes"].shape == (4, 5)
+    assert output["predicted_codes"].shape == (4, 5)
+    assert output["target_codes"].shape == (4, 5)
+    assert output["target_residual"].shape == (4, 8)
     assert bool(
         ((output["high_codes"] > 0).sum(dim=-1) <= model.cfg.k_high).all()
     )
@@ -99,7 +102,9 @@ def test_high_and_low_reconstruction_are_cumulative() -> None:
             SparseAutoencoderConfig(d_in=8, d_sae=20, k=5)
         ),
     )
-    output = model(torch.randn(3, 6, 8))
+    output = model(
+        torch.randn(3, 8), torch.randn(3, 8), torch.tensor([1, 2, 5])
+    )
     expected = output["online_high_reconstruction"] + model.decode_low(
         output["online_target_low_code"], ema=False, add_bias=False
     )

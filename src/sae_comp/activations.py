@@ -13,7 +13,19 @@ from tqdm import tqdm
 from .config import ExperimentConfig
 
 
-FORMAT = "sae-comp-activation-shards-v1"
+FORMAT = "sae-comp-long-residual-sequences-v2"
+
+
+def activation_config_fingerprint(cfg: ExperimentConfig) -> str:
+    identity = {
+        "format": FORMAT,
+        "model": cfg.as_dict()["model"],
+        "data": cfg.as_dict()["data"],
+        "min_span_length": cfg.proposal.min_span_length,
+        "max_span_length": max(cfg.proposal.window_sizes),
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _split_for_document(text: str, validation_fraction: float) -> str:
@@ -52,7 +64,17 @@ def extract_activations(cfg: ExperimentConfig, overwrite: bool = False) -> Path:
     output = Path(cfg.activation_dir)
     manifest_path = output / "manifest.json"
     if manifest_path.exists() and not overwrite:
-        return manifest_path
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            existing.get("format") == FORMAT
+            and existing.get("config_fingerprint")
+            == activation_config_fingerprint(cfg)
+        ):
+            return manifest_path
+        raise ValueError(
+            f"{manifest_path} is an incompatible activation cache; use the new "
+            "activation_dir or rerun extract with --overwrite"
+        )
     output.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(cfg.train.device)
@@ -121,6 +143,7 @@ def extract_activations(cfg: ExperimentConfig, overwrite: bool = False) -> Path:
                 "activations": activations,
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
+                "valid_lengths": attention_mask.sum(dim=1).to(torch.int32),
             },
             destination,
         )
@@ -191,8 +214,6 @@ def extract_activations(cfg: ExperimentConfig, overwrite: bool = False) -> Path:
         if queued[split] >= targets[split]:
             continue
         tokens = tokenizer.encode(text, add_special_tokens=False)
-        if tokenizer.bos_token_id is not None:
-            tokens = [tokenizer.bos_token_id, *tokens]
         for start in range(0, len(tokens), cfg.data.sequence_length):
             if queued[split] >= targets[split]:
                 break
@@ -223,7 +244,7 @@ def extract_activations(cfg: ExperimentConfig, overwrite: bool = False) -> Path:
     resolved_revision = getattr(model.config, "_commit_hash", None)
     manifest = {
         "format": FORMAT,
-        "config_fingerprint": cfg.fingerprint(),
+        "config_fingerprint": activation_config_fingerprint(cfg),
         "dataset": {
             "name": cfg.data.dataset,
             "config": cfg.data.dataset_config,
@@ -240,6 +261,17 @@ def extract_activations(cfg: ExperimentConfig, overwrite: bool = False) -> Path:
             "hook": "hidden_states[layer + 1]",
         },
         "sequence_length": cfg.data.sequence_length,
+        "min_span_length": cfg.proposal.min_span_length,
+        "max_span_length": max(cfg.proposal.window_sizes),
+        "max_horizon": max(cfg.proposal.window_sizes) - 1,
+        "burn_in_tokens": cfg.data.burn_in_tokens,
+        "minimum_valid_length": cfg.data.min_valid_tokens,
+        "pair_sampling": {
+            "span_length": "uniform integer in [min_span_length, max_span_length]",
+            "context": "uniform over non-endpoint positions in sampled span",
+            "endpoint_support": "shared across all horizons and sweep conditions",
+            "performed_online_during_training": True,
+        },
         "d_in": d_in,
         "normalization": {
             "mean": mean.tolist(),
@@ -271,7 +303,19 @@ def load_manifest(path: str | Path) -> tuple[Path, dict[str, Any]]:
         manifest_path = manifest_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format") != FORMAT:
-        raise ValueError(f"unsupported activation format: {manifest_path}")
+        raise ValueError(
+            f"unsupported activation format: {manifest_path}; re-extract long "
+            "residual sequences with the current extract stage"
+        )
+    max_span = int(manifest["max_span_length"])
+    min_span = int(manifest["min_span_length"])
+    burn_in = int(manifest["burn_in_tokens"])
+    if not 2 <= min_span <= max_span:
+        raise ValueError("span bounds must satisfy 2 <= min <= max")
+    if int(manifest["max_horizon"]) != max_span - 1:
+        raise ValueError("max_horizon must equal max_span_length - 1")
+    if int(manifest["minimum_valid_length"]) < burn_in + max_span:
+        raise ValueError("minimum_valid_length exposes a sequence boundary")
     return manifest_path.parent, manifest
 
 
@@ -300,9 +344,12 @@ class ActivationStore:
         while True:
             for record in self._records(split, epoch):
                 shard = load_shard(self.root, record)
-                mask = shard["attention_mask"]
+                source_mask = shard["attention_mask"]
+                mask = source_mask.clone()
+                burn_in = int(self.manifest["burn_in_tokens"])
+                mask[:, :burn_in] = False
                 if minimum_sequence_length is not None:
-                    eligible = mask.sum(dim=1) >= minimum_sequence_length
+                    eligible = source_mask.sum(dim=1) >= minimum_sequence_length
                     mask = mask & eligible[:, None]
                 values = shard["activations"][mask]
                 order = torch.randperm(len(values), generator=generator)
@@ -328,7 +375,8 @@ class ActivationStore:
                 if minimum_sequence_length is not None:
                     eligible = mask.sum(dim=1) >= minimum_sequence_length
                     pair_mask &= eligible[:, None]
-                pair_mask[:, 0] = False
+                burn_in = int(self.manifest["burn_in_tokens"])
+                pair_mask[:, : burn_in + 1] = False
                 rows, times = pair_mask.nonzero(as_tuple=True)
                 order = torch.randperm(len(rows), generator=generator)
                 for start in range(0, len(order) - batch_size + 1, batch_size):
@@ -354,6 +402,81 @@ class ActivationStore:
                         activations[batch_rows, current_times],
                         activations[batch_rows, previous_times],
                     )
+            epoch += 1
+
+    def random_pair_batches(
+        self,
+        batch_size: int,
+        max_span_length: int,
+        min_span_length: int = 2,
+        boundary_max_horizon: int | None = None,
+        split: str = "train",
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        """Yield deterministic random span/context/endpoint training pairs."""
+        stored_max_span = int(self.manifest["max_span_length"])
+        if not 2 <= min_span_length <= max_span_length <= stored_max_span:
+            raise ValueError(
+                "span bounds must satisfy 2 <= min <= max <= stored maximum"
+            )
+        boundary_horizon = (
+            stored_max_span - 1
+            if boundary_max_horizon is None
+            else boundary_max_horizon
+        )
+        if boundary_horizon < max_span_length - 1:
+            raise ValueError("boundary horizon must cover the sampled horizon")
+        burn_in = int(self.manifest["burn_in_tokens"])
+        generator = torch.Generator().manual_seed(self.seed + 2)
+        epoch = 0
+        pending: dict[str, list[torch.Tensor]] = {}
+        pending_count = 0
+        while True:
+            for record in self._records(split, epoch):
+                shard = load_shard(self.root, record)
+                sequences = shard["activations"]
+                valid_lengths = shard.get("valid_lengths")
+                if valid_lengths is None:
+                    valid_lengths = shard["attention_mask"].sum(dim=1)
+                eligible = valid_lengths > burn_in + boundary_horizon
+                rows = eligible.nonzero(as_tuple=True)[0]
+                rows = rows.index_select(
+                    0, torch.randperm(len(rows), generator=generator)
+                )
+                if not len(rows):
+                    continue
+                lengths = valid_lengths.index_select(0, rows).long()
+                span_lengths = torch.randint(
+                    min_span_length,
+                    max_span_length + 1,
+                    (len(rows),),
+                    generator=generator,
+                )
+                horizons = 1 + torch.floor(
+                    torch.rand(len(rows), generator=generator)
+                    * (span_lengths - 1)
+                ).long()
+                sampled = _sample_random_pairs(
+                    sequences,
+                    lengths,
+                    rows,
+                    span_lengths,
+                    horizons,
+                    burn_in,
+                    boundary_horizon,
+                    generator,
+                )
+                for key, value in sampled.items():
+                    pending.setdefault(key, []).append(value)
+                pending_count += len(rows)
+                while pending_count >= batch_size:
+                    joined = {key: torch.cat(values) for key, values in pending.items()}
+                    yield {key: value[:batch_size] for key, value in joined.items()}
+                    pending = {
+                        key: [value[batch_size:]]
+                        for key, value in joined.items()
+                        if len(value) > batch_size
+                    }
+                    pending_count -= batch_size
             epoch += 1
 
     def window_batches(
@@ -392,3 +515,36 @@ class ActivationStore:
     def validation_shards(self) -> Iterator[dict[str, torch.Tensor]]:
         for record in self.manifest["validation"]["shards"]:
             yield load_shard(self.root, record)
+
+
+def _sample_random_pairs(
+    sequences: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    rows: torch.Tensor,
+    span_lengths: torch.Tensor,
+    horizons: torch.Tensor,
+    burn_in_tokens: int,
+    boundary_max_horizon: int,
+    generator: torch.Generator,
+) -> dict[str, torch.Tensor]:
+    if torch.any(horizons < 1) or torch.any(horizons >= span_lengths):
+        raise ValueError("each horizon must lie in [1, span_length-1]")
+    minimum_endpoints = torch.full_like(
+        horizons, burn_in_tokens + boundary_max_horizon
+    )
+    if torch.any(minimum_endpoints >= valid_lengths):
+        raise ValueError("sequence is too short for burn-in and sampled horizon")
+    endpoint_support = valid_lengths - minimum_endpoints
+    endpoints = minimum_endpoints + torch.floor(
+        torch.rand(len(rows), generator=generator) * endpoint_support
+    ).long()
+    contexts = endpoints - horizons
+    return {
+        "context": sequences[rows, contexts],
+        "target": sequences[rows, endpoints],
+        "span_length": span_lengths,
+        "horizon": horizons,
+        "span_start_index": endpoints - span_lengths + 1,
+        "context_index": contexts,
+        "endpoint_index": endpoints,
+    }

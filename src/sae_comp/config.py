@@ -26,6 +26,7 @@ class DataConfig:
     text_field: str = "text"
     sequence_length: int = 128
     min_valid_tokens: int = 32
+    burn_in_tokens: int = 16
     train_sequences: int = 40_960
     validation_sequences: int = 1_024
     shard_sequences: int = 256
@@ -70,33 +71,29 @@ class TrainConfig:
 
 @dataclass(frozen=True)
 class ProposalConfig:
-    window_size: int = 10
-    window_sizes: tuple[int, ...] = (8, 16, 32, 64, 128)
-    sweep_residual_positions_per_step: int = 512
+    window_size: int = 16
+    window_sizes: tuple[int, ...] = (2, 4, 8, 16)
+    min_span_length: int = 2
+    sweep_pairs_per_step: int = 512
     high_fraction: float = 0.2
     high_reconstruction_weight: float = 0.2
     predictor_width: int = 256
     predictor_expansion: int = 2
-    predictor_warmup_steps: int = 800
+    sae_warmup_steps: int = 2_000
     prediction_ramp_steps: int = 800
     prediction_weight: float = 1.0
-    residual_prediction_weight: float = 0.1
+    horizon_weighting: str = "inverse_probability"
     ema_decay: float = 0.996
 
     def sweep_budget(self, window_size: int) -> dict[str, int]:
-        if self.sweep_residual_positions_per_step % window_size:
-            raise ValueError(
-                "sweep_residual_positions_per_step must be divisible by every "
-                "proposal window size"
-            )
-        batch_windows = self.sweep_residual_positions_per_step // window_size
         return {
             "window_size": window_size,
-            "batch_windows": batch_windows,
-            "residual_positions_per_step": self.sweep_residual_positions_per_step,
-            "endpoint_reconstructions_per_step": batch_windows,
-            "context_positions_per_window": window_size - 1,
-            "context_target_pairs_per_step": batch_windows * (window_size - 1),
+            "pair_batch_size": self.sweep_pairs_per_step,
+            "sampled_pairs_per_step": self.sweep_pairs_per_step,
+            "residual_values_per_step": 2 * self.sweep_pairs_per_step,
+            "endpoint_reconstructions_per_step": self.sweep_pairs_per_step,
+            "minimum_horizon": 1,
+            "maximum_horizon": window_size - 1,
         }
 
 
@@ -157,8 +154,8 @@ class SAEBenchConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    run_dir: str = "runs/paper-pythia160m-hierarchical-v1"
-    activation_dir: str = "data/pythia160m-layer8"
+    run_dir: str = "runs/paper-pythia160m-random-pair-v3"
+    activation_dir: str = "data/pythia160m-layer8-long-sequences-v2"
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     sae: SAEConfig = field(default_factory=SAEConfig)
@@ -174,12 +171,21 @@ class ExperimentConfig:
             raise ValueError("sequence_length must be at least proposal.window_size")
         if not 0 < self.data.validation_fraction < 1:
             raise ValueError("validation_fraction must lie in (0, 1)")
-        if self.data.min_valid_tokens < self.proposal.window_size:
-            raise ValueError("min_valid_tokens must be at least proposal.window_size")
+        if self.data.burn_in_tokens < 0:
+            raise ValueError("burn_in_tokens must be non-negative")
+        if self.data.min_valid_tokens > self.data.sequence_length:
+            raise ValueError("min_valid_tokens must not exceed sequence_length")
         if not self.proposal.window_sizes:
             raise ValueError("proposal.window_sizes must not be empty")
         if len(set(self.proposal.window_sizes)) != len(self.proposal.window_sizes):
             raise ValueError("proposal.window_sizes must be unique")
+        maximum_window = max(self.proposal.window_sizes)
+        if not 2 <= self.proposal.min_span_length <= min(self.proposal.window_sizes):
+            raise ValueError("min_span_length must lie in [2, min(window_sizes)]")
+        if self.data.min_valid_tokens < self.data.burn_in_tokens + maximum_window:
+            raise ValueError(
+                "min_valid_tokens must cover burn_in_tokens + max(window_sizes)"
+            )
         for window_size in self.proposal.window_sizes:
             if window_size < 2:
                 raise ValueError("proposal window sizes must be at least 2")
@@ -209,8 +215,12 @@ class ExperimentConfig:
             raise ValueError(
                 "temporal_pairs_per_step must lie in [1, token_batch_size]"
             )
-        if not 0 <= self.proposal.predictor_warmup_steps < self.train.branch_steps:
-            raise ValueError("predictor_warmup_steps must be smaller than branch_steps")
+        if not 0 <= self.proposal.sae_warmup_steps < self.train.branch_steps:
+            raise ValueError("sae_warmup_steps must be smaller than branch_steps")
+        if self.proposal.sweep_pairs_per_step < 1:
+            raise ValueError("sweep_pairs_per_step must be positive")
+        if self.proposal.horizon_weighting not in {"none", "inverse_probability"}:
+            raise ValueError("unsupported proposal.horizon_weighting")
         if not self.sae_bench.enabled:
             return
         allowed_saebench_evals = {
@@ -314,7 +324,7 @@ def apply_training_overrides(
     standard_steps: int | None = None,
     branch_steps: int | None = None,
     warmup_steps: int | None = None,
-    predictor_warmup_steps: int | None = None,
+    sae_warmup_steps: int | None = None,
     prediction_ramp_steps: int | None = None,
     run_dir: str | None = None,
 ) -> ExperimentConfig:
@@ -346,10 +356,10 @@ def apply_training_overrides(
         if warmup_steps is None
         else warmup_steps
     )
-    resolved_predictor_warmup = (
-        scaled(cfg.proposal.predictor_warmup_steps, allow_zero=True)
-        if predictor_warmup_steps is None
-        else predictor_warmup_steps
+    resolved_sae_warmup = (
+        scaled(cfg.proposal.sae_warmup_steps, allow_zero=True)
+        if sae_warmup_steps is None
+        else sae_warmup_steps
     )
     resolved_prediction_ramp = (
         scaled(cfg.proposal.prediction_ramp_steps)
@@ -358,7 +368,7 @@ def apply_training_overrides(
     )
     if resolved_standard < 1 or resolved_branch < 1:
         raise ValueError("standard_steps and branch_steps must be positive")
-    if resolved_warmup < 0 or resolved_predictor_warmup < 0:
+    if resolved_warmup < 0 or resolved_sae_warmup < 0:
         raise ValueError("warmup step counts must be non-negative")
     if resolved_prediction_ramp < 1:
         raise ValueError("prediction_ramp_steps must be positive")
@@ -367,14 +377,14 @@ def apply_training_overrides(
         cfg.train.standard_steps,
         cfg.train.branch_steps,
         cfg.train.warmup_steps,
-        cfg.proposal.predictor_warmup_steps,
+        cfg.proposal.sae_warmup_steps,
         cfg.proposal.prediction_ramp_steps,
     )
     resolved_budget = (
         resolved_standard,
         resolved_branch,
         resolved_warmup,
-        resolved_predictor_warmup,
+        resolved_sae_warmup,
         resolved_prediction_ramp,
     )
     budget_changed = resolved_budget != base_budget
@@ -389,7 +399,7 @@ def apply_training_overrides(
                     standard_steps,
                     branch_steps,
                     warmup_steps,
-                    predictor_warmup_steps,
+                    sae_warmup_steps,
                     prediction_ramp_steps,
                 )
             )
@@ -399,7 +409,7 @@ def apply_training_overrides(
             else:
                 suffix = (
                     f"budget-s{resolved_standard}-b{resolved_branch}"
-                    f"-w{resolved_warmup}-pw{resolved_predictor_warmup}"
+                    f"-w{resolved_warmup}-sw{resolved_sae_warmup}"
                     f"-pr{resolved_prediction_ramp}"
                 )
             resolved_run_dir = f"{cfg.run_dir}-{suffix}"
@@ -415,7 +425,7 @@ def apply_training_overrides(
         ),
         proposal=replace(
             cfg.proposal,
-            predictor_warmup_steps=resolved_predictor_warmup,
+            sae_warmup_steps=resolved_sae_warmup,
             prediction_ramp_steps=resolved_prediction_ramp,
         ),
     )

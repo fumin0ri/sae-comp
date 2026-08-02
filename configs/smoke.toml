@@ -1,5 +1,5 @@
-run_dir = "runs/smoke-hierarchical-v1"
-activation_dir = "data/smoke"
+run_dir = "runs/smoke-random-pair-v3"
+activation_dir = "data/smoke-long-v2"
 
 [model]
 name = "EleutherAI/pythia-70m-deduped"
@@ -14,7 +14,8 @@ revision = "fcbfcfde4222cbb1acd1d33bad0be250ee14b1bb"
 split = "train"
 text_field = "text"
 sequence_length = 32
-min_valid_tokens = 10
+min_valid_tokens = 24
+burn_in_tokens = 8
 train_sequences = 256
 validation_sequences = 32
 shard_sequences = 32
@@ -53,17 +54,18 @@ amp_dtype = "bfloat16"
 device = "cuda"
 
 [proposal]
-window_size = 10
-window_sizes = [8, 16, 32]
-sweep_residual_positions_per_step = 128
+window_size = 16
+window_sizes = [2, 4, 8, 16]
+min_span_length = 2
+sweep_pairs_per_step = 128
 high_fraction = 0.2
 high_reconstruction_weight = 0.2
 predictor_width = 64
 predictor_expansion = 2
-predictor_warmup_steps = 5
+sae_warmup_steps = 5
 prediction_ramp_steps = 5
 prediction_weight = 1.0
-residual_prediction_weight = 0.1
+horizon_weighting = "inverse_probability"
 ema_decay = 0.996
 
 [evaluation]

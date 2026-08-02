@@ -14,9 +14,10 @@ plt.switch_backend("Agg")
 COLORS = {
     "standard": "#4C78A8",
     "temporal": "#F58518",
-    "proposal_w016": "#54A24B",
-    "proposal_w032": "#E45756",
-    "proposal_w064": "#B279A2",
+    "proposal_w002": "#54A24B",
+    "proposal_w004": "#E45756",
+    "proposal_w008": "#72B7B2",
+    "proposal_w016": "#B279A2",
 }
 
 
@@ -26,7 +27,7 @@ def display_name(label: str) -> str:
     if label == "temporal":
         return "Temporal SAE"
     if label.startswith("proposal_w"):
-        return f"Hierarchical proposal W={int(label.removeprefix('proposal_w'))}"
+        return f"Random-pair proposal W={int(label.removeprefix('proposal_w'))}"
     return label
 
 
@@ -151,7 +152,7 @@ def _plot_forecasts(metrics: dict[str, Any], output_dir: Path) -> Path:
     forecasts = metrics["proposal_forecasts"]
     figure, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
     figure.suptitle(
-        "Fixed-endpoint forecast diagnostics by horizon",
+        "Random-pair endpoint forecast diagnostics by horizon",
         fontsize=16,
         fontweight="bold",
     )

@@ -58,7 +58,7 @@ def _add_training_override_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--standard-steps", type=int)
     parser.add_argument("--branch-steps", type=int)
     parser.add_argument("--warmup-steps", type=int)
-    parser.add_argument("--predictor-warmup-steps", type=int)
+    parser.add_argument("--sae-warmup-steps", type=int)
     parser.add_argument("--prediction-ramp-steps", type=int)
     parser.add_argument(
         "--run-dir",
@@ -99,7 +99,7 @@ def main() -> None:
         standard_steps=args.standard_steps,
         branch_steps=args.branch_steps,
         warmup_steps=args.warmup_steps,
-        predictor_warmup_steps=args.predictor_warmup_steps,
+        sae_warmup_steps=args.sae_warmup_steps,
         prediction_ramp_steps=args.prediction_ramp_steps,
         run_dir=args.run_dir,
     )
@@ -108,7 +108,7 @@ def main() -> None:
         f"shared={cfg.train.standard_steps} steps, "
         f"branch={cfg.train.branch_steps} steps, "
         f"warmup={cfg.train.warmup_steps}, "
-        f"predictor_warmup={cfg.proposal.predictor_warmup_steps}, "
+        f"sae_warmup={cfg.proposal.sae_warmup_steps}, "
         f"prediction_ramp={cfg.proposal.prediction_ramp_steps}, "
         f"run_dir={cfg.run_dir}"
     )

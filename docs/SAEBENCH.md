@@ -7,6 +7,11 @@ API drift による結果差を避けるため、`sae-bench==0.6.0` に固定し
 `EleutherAI/pythia-160m-deduped` です。TransformerLens 側の model name は
 `pythia-160m-deduped`、hook は `blocks.8.hook_resid_post` です。
 
+比較条件はStandard Top-K、Temporal SAE、random-pair horizon JEPAの最大span
+`W=2,4,8,16`です。Proposalは長いdocument-disjoint Pile residual sequenceから
+span、endpoint、contextを学習stepごとに抽出します。SAEBenchへ渡すartifactは
+high/low分割と独立Top-Kを保持した最終full-EMA SAEです。
+
 Python 3.11ではTransformerLens 2.16.1が`torch>=2.6`を要求します。依存解決には
 repositoryの`constraints/saebench-cu128.txt`を使用し、PyTorch 2.7.1 /
 torchvision 0.22.1のcu128 wheelとSAEBench依存を固定します。これによりpipが
@@ -63,7 +68,7 @@ SAEは学習済みthresholdを使用します。
 ## Resume and outputs
 
 各評価は条件ごとに公式形式の JSON を即時保存します。`force_rerun=false` では
-既存 JSON を再利用します。各 stage の後に5条件すべてのファイルが存在するか検証し、
+既存 JSON を再利用します。各 stage の後に6条件すべてのファイルが存在するか検証し、
 欠損があれば完了扱いにしません。
 
 `saebench_results/manifest.json` には version、model、hook、実行対象、除外対象、
@@ -73,4 +78,4 @@ checkpoint path、stage status を記録します。`report-saebench` は公式 
 
 評価途中でも `report-saebench` を実行できます。存在する公式 JSON だけを集計し、
 評価ごとの完了条件数と不足条件をレポートに表示します。総合ダッシュボードは
-4評価×5条件がすべて揃った時点で生成されます。
+4評価×6条件がすべて揃った時点で生成されます。

@@ -168,6 +168,7 @@ def evaluate_method(
             x = shard["activations"][row][mask].to(device)
             if len(x) < (minimum_sequence_length or 2):
                 continue
+            x = x[cfg.data.burn_in_tokens :]
             features = sae.encode(x, method)
             reconstruction = sae.decode(features)
             total_squared_error += float(
@@ -219,79 +220,96 @@ def evaluate_proposal_forecast(
     cfg: ExperimentConfig,
     minimum_sequence_length: int | None = None,
 ) -> dict[str, Any]:
+    _ = minimum_sequence_length
     device = torch.device(cfg.train.device)
     _, proposal, method = load_method(checkpoint_path, device)
     if proposal is None:
         raise ValueError("proposal forecast requires a proposal checkpoint")
     store = ActivationStore(Path(cfg.activation_dir) / "manifest.json", cfg.train.seed)
-    contexts = proposal.cfg.window_size - 1
-    cosine_sum = torch.zeros(contexts, device=device)
-    shuffled_sum = torch.zeros(contexts, device=device)
-    normalized_mse_sum = torch.zeros(contexts, device=device)
+    max_horizon = proposal.cfg.window_size - 1
+    cosine_sum = torch.zeros(max_horizon + 1, device=device)
+    shuffled_sum = torch.zeros(max_horizon + 1, device=device)
+    horizon_only_sum = torch.zeros(max_horizon + 1, device=device)
+    normalized_mse_sum = torch.zeros(max_horizon + 1, device=device)
+    horizon_counts = torch.zeros(max_horizon + 1, device=device)
     count = 0
-    for shard in store.validation_shards():
-        activations = shard["activations"]
-        lengths = shard["attention_mask"].sum(dim=1).tolist()
-        required_length = minimum_sequence_length or proposal.cfg.window_size
-        windows = [
-            activations[row, start : start + proposal.cfg.window_size]
-            for row, length in enumerate(lengths)
-            if int(length) >= required_length
-            for start in range(
-                0,
-                int(length) - required_length + 1,
-                required_length,
-            )
-        ]
-        for start in range(0, len(windows), cfg.train.window_batch_size):
-            batch = torch.stack(
-                windows[start : start + cfg.train.window_batch_size]
-            ).to(device)
-            output = proposal(batch, use_ema_context=True)
-            targets = output["target_codes"]
-            prediction = output["predicted_codes"]
-            context = output["context_codes"]
-            permutation = torch.roll(
-                torch.arange(len(context), device=device), shifts=1
-            )
-            context_positions = torch.arange(contexts, device=device)
-            shuffled = proposal.predict_from_code(
-                context[permutation],
-                context_positions=context_positions,
-            )
-            cosine_sum += F.cosine_similarity(prediction, targets, dim=-1).sum(dim=0)
-            shuffled_sum += F.cosine_similarity(shuffled, targets, dim=-1).sum(dim=0)
-            energy = targets.float().square().mean(dim=-1).clamp_min(1e-8)
-            normalized_mse_sum += (
-                (prediction - targets).float().square().mean(dim=-1) / energy
-            ).sum(dim=0)
-            count += len(batch)
-            if count >= cfg.evaluation.max_sequences:
-                break
-        if count >= cfg.evaluation.max_sequences:
-            break
-    cosine = cosine_sum / max(count, 1)
-    shuffled = shuffled_sum / max(count, 1)
-    normalized_mse = normalized_mse_sum / max(count, 1)
+    iterator = store.random_pair_batches(
+        cfg.train.window_batch_size,
+        max_span_length=proposal.cfg.window_size,
+        min_span_length=cfg.proposal.min_span_length,
+        boundary_max_horizon=max(cfg.proposal.window_sizes) - 1,
+        split="validation",
+    )
+    while count < cfg.evaluation.max_sequences:
+        batch = {
+            key: value.to(device)
+            for key, value in next(iterator).items()
+        }
+        output = proposal(
+            batch["context"], batch["target"], batch["horizon"]
+        )
+        targets = output["target_codes"]
+        prediction = output["predicted_codes"]
+        context = output["context_codes"]
+        permutation = torch.roll(torch.arange(len(context), device=device), 1)
+        shuffled = proposal.predict_from_code(
+            context[permutation], batch["horizon"]
+        )
+        horizon_only = proposal.predict_from_code(
+            context, batch["horizon"], use_context=False
+        )
+        horizon = batch["horizon"]
+        ones = torch.ones_like(horizon, dtype=torch.float32)
+        horizon_counts.index_add_(0, horizon, ones)
+        cosine_sum.index_add_(
+            0, horizon, F.cosine_similarity(prediction, targets, dim=-1)
+        )
+        shuffled_sum.index_add_(
+            0, horizon, F.cosine_similarity(shuffled, targets, dim=-1)
+        )
+        horizon_only_sum.index_add_(
+            0, horizon, F.cosine_similarity(horizon_only, targets, dim=-1)
+        )
+        energy = targets.float().square().mean(dim=-1).clamp_min(1e-8)
+        normalized_mse_sum.index_add_(
+            0,
+            horizon,
+            (prediction - targets).float().square().mean(dim=-1) / energy,
+        )
+        count += len(horizon)
+    denominator = horizon_counts.clamp_min(1)
+    cosine = cosine_sum / denominator
+    shuffled = shuffled_sum / denominator
+    horizon_only = horizon_only_sum / denominator
+    normalized_mse = normalized_mse_sum / denominator
     return {
         "method": method,
-        "windows": count,
+        "pairs": count,
         "offsets": [
             {
                 "offset": horizon,
                 "horizon": horizon,
-                "context_position": contexts - horizon,
-                "code_cosine": float(cosine[contexts - horizon]),
-                "shuffled_code_cosine": float(shuffled[contexts - horizon]),
+                "code_cosine": float(cosine[horizon]),
+                "shuffled_code_cosine": float(shuffled[horizon]),
+                "horizon_only_code_cosine": float(horizon_only[horizon]),
                 "true_minus_shuffled": float(
-                    cosine[contexts - horizon] - shuffled[contexts - horizon]
+                    cosine[horizon] - shuffled[horizon]
                 ),
-                "normalized_mse": float(normalized_mse[contexts - horizon]),
+                "true_minus_horizon_only": float(
+                    cosine[horizon] - horizon_only[horizon]
+                ),
+                "normalized_mse": float(normalized_mse[horizon]),
+                "pairs": int(horizon_counts[horizon]),
             }
-            for horizon in range(1, contexts + 1)
+            for horizon in range(1, max_horizon + 1)
         ],
-        "mean_code_cosine": float(cosine.mean()),
-        "mean_true_minus_shuffled": float((cosine - shuffled).mean()),
+        "mean_code_cosine": float(cosine[1:].mean()),
+        "mean_true_minus_shuffled": float(
+            (cosine[1:] - shuffled[1:]).mean()
+        ),
+        "mean_true_minus_horizon_only": float(
+            (cosine[1:] - horizon_only[1:]).mean()
+        ),
     }
 
 
@@ -373,15 +391,15 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
             "training_budget": {
                 **budget,
                 "optimizer_steps": cfg.train.branch_steps,
-                "total_residual_positions": (
-                    budget["residual_positions_per_step"] * cfg.train.branch_steps
+                "total_residual_values": (
+                    budget["residual_values_per_step"] * cfg.train.branch_steps
                 ),
                 "total_endpoint_reconstructions": (
                     budget["endpoint_reconstructions_per_step"]
                     * cfg.train.branch_steps
                 ),
-                "total_context_target_pairs": (
-                    budget["context_target_pairs_per_step"]
+                "total_sampled_pairs": (
+                    budget["sampled_pairs_per_step"]
                     * cfg.train.branch_steps
                 ),
             },
@@ -400,11 +418,11 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
         fieldnames = [
             "method",
             "window_size",
-            "batch_windows",
+            "pair_batch_size",
             "optimizer_steps",
-            "total_residual_positions",
+            "total_residual_values",
             "total_endpoint_reconstructions",
-            "total_context_target_pairs",
+            "total_sampled_pairs",
             "fve",
             "cosine_similarity",
             "fraction_alive",
@@ -427,16 +445,16 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
                 {
                     "method": label,
                     "window_size": values["window_size"],
-                    "batch_windows": budget["batch_windows"],
+                    "pair_batch_size": budget["pair_batch_size"],
                     "optimizer_steps": budget["optimizer_steps"],
-                    "total_residual_positions": budget[
-                        "total_residual_positions"
+                    "total_residual_values": budget[
+                        "total_residual_values"
                     ],
                     "total_endpoint_reconstructions": budget[
                         "total_endpoint_reconstructions"
                     ],
-                    "total_context_target_pairs": budget[
-                        "total_context_target_pairs"
+                    "total_sampled_pairs": budget[
+                        "total_sampled_pairs"
                     ],
                     "fve": common["fve"],
                     "cosine_similarity": common["cosine_similarity"],
@@ -478,7 +496,9 @@ def controlled_checkpoint_paths(cfg: ExperimentConfig) -> dict[str, Path]:
 
 
 def evaluate_controlled_comparison(cfg: ExperimentConfig) -> dict[str, Any]:
-    minimum_sequence_length = max(cfg.proposal.window_sizes)
+    minimum_sequence_length = (
+        cfg.data.burn_in_tokens + max(cfg.proposal.window_sizes)
+    )
     common_horizon = min(cfg.proposal.window_sizes) - 1
     checkpoints = controlled_checkpoint_paths(cfg)
     methods = {

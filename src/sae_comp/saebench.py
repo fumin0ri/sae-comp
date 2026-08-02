@@ -152,7 +152,7 @@ def checkpoint_to_saebench(
         "standard": "standard-topk",
         "temporal": "temporal-batchtopk",
         "proposal": (
-            "hierarchical-high-low-fixed-endpoint-full-ema-"
+            "high-low-random-pair-horizon-full-ema-"
             f"{label.removeprefix('proposal_')}"
         ),
     }[method]

@@ -1,46 +1,62 @@
-# Proposal window-width sweep
+# Proposal maximum-span sweep
 
-提案手法は `W = 16, 32, 64` の3条件で比較します。全条件は
-`runs/saebench-pythia160m-deduped-hierarchical-v1/checkpoints/shared_initialization.pt`
+提案手法は最大span長 `W = 2, 4, 8, 16` の4条件で比較します。全条件は
+`runs/saebench-pythia160m-deduped-random-pair-v3/checkpoints/shared_initialization.pt`
 から開始します。
+
+## 学習データ生成
+
+Pileのdocumentをtrain/validationへ決定論的に分離し、各documentを128 tokenの長い
+連続residual sequenceとして保存します。最初の16 tokenはburn-inとして学習・評価
+対象から除外します。旧固定window cacheとはformat IDが異なるため再抽出が必要です。
+
+各proposal sampleでは次をonlineに実行します。
+
+1. `L ~ Uniform(2, W)`を抽出する。
+2. 全Wで共通のeligible rangeからendpoint `t`を抽出する。
+3. span `[t-L+1,t]` の非endpoint位置からcontext `k`を一様抽出する。
+4. `h=t-k`をpredictorへ明示的に渡す。
+
+endpoint rangeは最大条件W=16のhorizon 15を使って固定するため、horizonやWから
+sequence境界までの距離を推測できません。
 
 ## 等学習量の制御
 
-| W | Windows / step | Residual positions / step | Contexts / window | Context-target pairs / step |
+| Max span W | Pair batch / step | Residual values / step | Endpoint reconstructions / step | Horizon support |
 |---:|---:|---:|---:|---:|
-| 16 | 32 | 512 | 15 | 480 |
-| 32 | 16 | 512 | 31 | 496 |
-| 64 | 8 | 512 | 63 | 504 |
+| 2 | 512 | 1,024 | 512 | 1 |
+| 4 | 512 | 1,024 | 512 | 1..3 |
+| 8 | 512 | 1,024 | 512 | 1..7 |
+| 16 | 512 | 1,024 | 512 | 1..15 |
 
-各条件は6,000 optimizer steps、合計3,072,000 residual positionsを処理します。
-全条件が64 token以上の同じtraining sequence poolを使います。新版は窓内の
-全context位置から同じ固定終端を予測するため、pairを旧方式のようにsubsample
-しません。したがってpair数はWによってわずかに異なりますが、損失は全pairの
-平均です。
+各条件は6,000 optimizer stepsで、合計3,072,000 sampled pairsとendpoint
+reconstructionsを処理します。span/context samplingが作る非一様な`P(h)`に対し、
+latent prediction lossを`1 / ((W-1)P(h))`で重み付けします。これにより各horizonの
+期待prediction-loss massが同じになります。再構成lossの重みは変更しません。
 
-最大Wの predictor を共通初期値として作成し、小さいWでは position embedding の
-先頭部分をコピーします。これにより共有可能なパラメータの初期値も一致します。
+最大Wのpredictorを共通初期値として作成し、小さいWではhorizon embeddingの対応する
+先頭行をコピーします。共有可能な全パラメータの初期値も一致します。
 
-## 提案手法のhigh/low固定終端目的
+## 目的関数
 
-`T=W-1` とすると、各 `k=0,...,T-1` について
-`P(z_high_k, position(k))` が同じstop-gradient EMA target `z_high_T` を予測します。
-辞書と総Top-Kを20% high / 80% lowへ分けて独立Top-Kを適用します。high-only
-終端再構成へ0.2、high+lowのfull再構成へ0.8を与え、lowには予測lossを与えません。
-予測high codeはfrozen EMA high decoderでresidualへ戻します。joint phase後は
-high/low全体のonline encoder、decoder、pre-biasをEMA更新し、その完全EMA SAEを
-SAEBenchへ渡します。variance regularizerは使用しません。
+```text
+z_context = E_online(x_(t-h))
+z_target  = stopgrad(E_EMA(x_t))
+z_hat_t   = P(z_context_high, h)
+
+L_rec = 0.2 * FVU(D_high(z_t_high), x_t)
+      + 0.8 * FVU(D_high(z_t_high)+D_low(z_t_low), x_t)
+L = L_rec + lambda_pred * balanced_latent_prediction_loss
+```
+
+予測codeをresidualへdecodeした誤差は評価diagnosticだけで、学習lossには含めません。
+最初のSAE-only warm-upではprediction weightを0とし、その後rampしてjoint学習します。
+online encoder、decoder、pre-bias全体をEMA更新し、完全EMA SAEをSAEBenchへ渡します。
 
 ## 評価
 
-Standard Top-K SAE、Temporal SAE、3つのWの階層型完全EMA SAEを同じcustom SAE
-interfaceに変換し、
-同一の SAEBench 呼び出しに渡します。SAEBench adapter は decoder の unit norm を
-保ったまま activation normalization を feature scale に移すため、元 checkpoint と
-再構成結果が一致します。Proposal adapterはhigh/lowの独立Top-Kも保持します。
-
-実行する評価は `core`、`sparse_probing`、
-`sparse_probing_sae_probes`、`RAVEL` です。TPP と SCR は実行しません。
+Standard Top-K SAE、Temporal SAE、4つのproposalを同じcustom SAE interfaceと
+SAEBench設定で評価します。TPPとSCRは実行しません。
 
 ```bash
 python -m pip install --upgrade \

@@ -11,11 +11,18 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
     cfg = replace(
         base,
         run_dir=str(tmp_path),
-        proposal=replace(base.proposal, window_sizes=(16, 32, 64)),
+        proposal=replace(base.proposal, window_sizes=(2, 4, 8, 16)),
     )
     evaluation_dir = tmp_path / "evaluation"
     evaluation_dir.mkdir()
-    labels = ("standard", "temporal", "proposal_w016", "proposal_w032", "proposal_w064")
+    labels = (
+        "standard",
+        "temporal",
+        "proposal_w002",
+        "proposal_w004",
+        "proposal_w008",
+        "proposal_w016",
+    )
     methods = {
         label: {
             "fve": 0.8,
@@ -35,7 +42,7 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
     }
     forecasts = {
         label: {
-            "common_horizon_max_offset": 15,
+            "common_horizon_max_offset": 1,
             "common_horizon_mean_code_cosine": 0.7,
             "common_horizon_mean_true_minus_shuffled": 0.2,
             "offsets": [
@@ -48,9 +55,10 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
             ],
         }
         for label, window_size in (
+            ("proposal_w002", 2),
+            ("proposal_w004", 4),
+            ("proposal_w008", 8),
             ("proposal_w016", 16),
-            ("proposal_w032", 32),
-            ("proposal_w064", 64),
         )
     }
     metrics = {
@@ -61,7 +69,7 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
             "dictionary_size": cfg.sae.dictionary_size,
             "k": cfg.sae.k,
             "seed": cfg.train.seed,
-            "minimum_sequence_length": 64,
+            "minimum_sequence_length": 32,
             "branch_optimizer_steps": cfg.train.branch_steps,
             "reconstruction_tokens_per_step": cfg.train.token_batch_size,
             "temporal_pairs_per_step": cfg.train.temporal_pairs_per_step,

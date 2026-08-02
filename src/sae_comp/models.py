@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-PROPOSAL_ARCHITECTURE_ID = "hierarchical_high_low_fixed_endpoint_ema_sae_v1"
+PROPOSAL_ARCHITECTURE_ID = "high_low_random_pair_horizon_ema_sae_v3"
 
 
 def token_topk(values: torch.Tensor, k: int) -> torch.Tensor:
@@ -144,6 +144,8 @@ class TransitionJEPAConfig:
     ema_decay: float = 0.996
 
     def __post_init__(self) -> None:
+        if self.window_size < 2:
+            raise ValueError("window_size/max_span_length must be at least two")
         if not 0 < self.high_fraction < 1:
             raise ValueError("high_fraction must lie strictly between zero and one")
         if not 0 <= self.high_reconstruction_weight <= 1:
@@ -173,15 +175,15 @@ class TransitionJEPAConfig:
         return self.k - self.k_high
 
 
-class PositionConditionedPredictor(nn.Module):
-    """Predict the fixed endpoint code from each context code and position."""
+class HorizonConditionedPredictor(nn.Module):
+    """Predict a future high code from context and explicit token distance."""
 
     def __init__(self, cfg: TransitionJEPAConfig, feature_dim: int):
         super().__init__()
         width = cfg.predictor_width
         hidden = cfg.predictor_expansion * width
         self.context_projection = nn.Linear(feature_dim, width, bias=False)
-        self.position_embedding = nn.Embedding(cfg.window_size, width)
+        self.horizon_embedding = nn.Embedding(cfg.window_size, width)
         self.mlp = nn.Sequential(
             nn.LayerNorm(width),
             nn.Linear(width, hidden),
@@ -196,20 +198,28 @@ class PositionConditionedPredictor(nn.Module):
     def forward(
         self,
         context_code: torch.Tensor,
-        context_positions: torch.Tensor,
+        horizons: torch.Tensor,
         use_context: bool = True,
     ) -> torch.Tensor:
-        if context_code.ndim == 2:
+        squeeze_context = context_code.ndim == 2
+        if squeeze_context:
             context_code = context_code[:, None, :]
         if context_code.ndim != 3:
             raise ValueError("context_code must have shape [batch, contexts, d_sae]")
-        if (
-            context_positions.ndim != 1
-            or len(context_positions) != context_code.shape[1]
+        if torch.any(horizons < 1) or torch.any(horizons >= self.horizon_embedding.num_embeddings):
+            raise ValueError("horizons must lie in [1, max_span_length-1]")
+        if squeeze_context and horizons.shape == (context_code.shape[0],):
+            horizon_state = self.horizon_embedding(horizons)[:, None, :]
+        elif (
+            not squeeze_context
+            and horizons.ndim == 1
+            and horizons.shape == (context_code.shape[1],)
         ):
-            raise ValueError(
-                "context_positions must contain one value for each context"
-            )
+            horizon_state = self.horizon_embedding(horizons)[None, :, :]
+        elif horizons.shape == context_code.shape[:2]:
+            horizon_state = self.horizon_embedding(horizons)
+        else:
+            raise ValueError("horizons must match the batch or context axis")
         if use_context:
             state = self.context_projection(context_code)
         else:
@@ -218,12 +228,12 @@ class PositionConditionedPredictor(nn.Module):
                 device=context_code.device,
                 dtype=context_code.dtype,
             )
-        queries = state + self.position_embedding(context_positions)[None]
-        return F.softplus(self.output(self.mlp(queries)))
+        output = F.softplus(self.output(self.mlp(state + horizon_state)))
+        return output[:, 0] if squeeze_context else output
 
 
 class TransitionJEPA(nn.Module):
-    """High/low SAE whose high block forecasts one fixed future endpoint."""
+    """High/low SAE trained from random context/endpoint/horizon pairs."""
 
     def __init__(self, cfg: TransitionJEPAConfig, initialized_sae: SparseAutoencoder):
         super().__init__()
@@ -237,7 +247,7 @@ class TransitionJEPA(nn.Module):
             requires_grad=False,
         )
         self.register_buffer("ema_pre_bias", self.sae.pre_bias.detach().clone())
-        self.predictor = PositionConditionedPredictor(cfg, cfg.d_high)
+        self.predictor = HorizonConditionedPredictor(cfg, cfg.d_high)
         for parameter in self.ema_encoder.parameters():
             parameter.requires_grad_(False)
         self.normalize_ema_decoder()
@@ -328,7 +338,7 @@ class TransitionJEPA(nn.Module):
     def predict_from_code(
         self,
         context_code: torch.Tensor,
-        context_positions: torch.Tensor | None = None,
+        horizons: torch.Tensor,
         *,
         use_context: bool = True,
         sparse_output: bool = False,
@@ -340,50 +350,38 @@ class TransitionJEPA(nn.Module):
                 f"context code must have width {self.cfg.d_high} (high) or "
                 f"{self.cfg.d_sae} (full)"
             )
-        if context_code.ndim == 2:
-            context_code = context_code[:, None, :]
-        if context_positions is None:
-            if context_code.shape[1] == self.cfg.window_size - 1:
-                context_positions = torch.arange(
-                    self.cfg.window_size - 1,
-                    device=context_code.device,
-                    dtype=torch.long,
-                )
-            elif context_code.shape[1] == 1:
-                context_positions = torch.zeros(
-                    1, device=context_code.device, dtype=torch.long
-                )
-            else:
-                raise ValueError(
-                    "explicit context_positions are required for this shape"
-                )
         dense = self.predictor(
             context_code,
-            context_positions.to(device=context_code.device, dtype=torch.long),
+            horizons.to(device=context_code.device, dtype=torch.long),
             use_context=use_context,
         )
         return token_topk(dense, self.cfg.k_high) if sparse_output else dense
 
     def forward(
         self,
-        windows: torch.Tensor,
+        context: torch.Tensor,
+        target: torch.Tensor,
+        horizon: torch.Tensor,
         *,
         use_context: bool = True,
         use_ema_context: bool = False,
     ) -> dict[str, torch.Tensor]:
-        if windows.ndim != 3 or windows.shape[1] != self.cfg.window_size:
-            raise ValueError(f"expected [batch, {self.cfg.window_size}, d_in] windows")
-        codes = self.sae.encode_token_topk(windows)
-        online_high, online_low = self.split_code(codes)
+        if context.ndim != 2 or context.shape[-1] != self.cfg.d_in:
+            raise ValueError("context must have shape [batch, d_in]")
+        if target.shape != context.shape:
+            raise ValueError("target must match context shape")
+        if horizon.shape != (len(context),):
+            raise ValueError("horizon must have shape [batch]")
+        target_codes_online = self.sae.encode_token_topk(target)
+        online_target_code, online_target_low_code = self.split_code(
+            target_codes_online
+        )
         if use_ema_context:
             with torch.no_grad():
-                ema_codes = self.encode_ema(windows[:, :-1])
-                context_codes, low_context_codes = self.split_code(ema_codes)
+                context_full_code = self.encode_ema(context)
         else:
-            context_codes = online_high[:, :-1]
-            low_context_codes = online_low[:, :-1]
-        online_target_code = online_high[:, -1]
-        online_target_low_code = online_low[:, -1]
+            context_full_code = self.sae.encode_token_topk(context)
+        context_code, low_context_code = self.split_code(context_full_code)
         online_high_reconstruction = self.decode_high(
             online_target_code, ema=False
         )
@@ -391,32 +389,28 @@ class TransitionJEPA(nn.Module):
             online_target_low_code, ema=False, add_bias=False
         )
         with torch.no_grad():
-            target_full_code = self.encode_ema(windows[:, -1])
+            target_full_code = self.encode_ema(target)
             target_code, target_low_code = self.split_code(target_full_code)
             target_high_reconstruction = self.decode_high(target_code, ema=True)
             target_reconstruction = target_high_reconstruction + self.decode_low(
                 target_low_code, ema=True, add_bias=False
             )
         predicted_codes = self.predict_from_code(
-            context_codes, use_context=use_context
+            context_code, horizon, use_context=use_context
         )
         sparse_prediction = token_topk(predicted_codes, self.cfg.k_high)
         predictable_residual = self.decode_high(sparse_prediction, ema=True)
-        target_codes = target_code[:, None, :].expand_as(predicted_codes)
-        target_residual = windows[:, -1][:, None, :].expand_as(
-            predictable_residual
-        )
         return {
-            "codes": codes,
-            "high_codes": online_high,
-            "low_codes": online_low,
-            "context_codes": context_codes,
-            "context_code": context_codes[:, 0],
-            "low_context_codes": low_context_codes,
-            "low_context_code": low_context_codes[:, 0],
+            "codes": target_codes_online,
+            "high_codes": online_target_code,
+            "low_codes": online_target_low_code,
+            "context_codes": context_code,
+            "context_code": context_code,
+            "low_context_codes": low_context_code,
+            "low_context_code": low_context_code,
             "online_target_code": online_target_code,
             "online_target_low_code": online_target_low_code,
-            "online_target_full_code": codes[:, -1],
+            "online_target_full_code": target_codes_online,
             "online_high_reconstruction": online_high_reconstruction,
             "online_target_reconstruction": online_target_reconstruction,
             "target_high_reconstruction": target_high_reconstruction,
@@ -424,10 +418,11 @@ class TransitionJEPA(nn.Module):
             "target_code": target_code,
             "target_low_code": target_low_code,
             "target_full_code": target_full_code,
-            "target_codes": target_codes,
+            "target_codes": target_code,
             "predicted_codes": predicted_codes,
             "sparse_predicted_codes": sparse_prediction,
-            "target_residual": target_residual,
+            "target_residual": target,
             "predictable_residual": predictable_residual,
-            "innovation_residual": target_residual - predictable_residual,
+            "innovation_residual": target - predictable_residual,
+            "horizon": horizon,
         }

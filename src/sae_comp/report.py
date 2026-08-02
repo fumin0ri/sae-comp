@@ -103,19 +103,17 @@ def build_window_sweep_report(cfg: ExperimentConfig) -> Path:
         if item["split"] == "full" and item["sparsity"] == preferred_sparsity
     }
     lines = [
-        "# Proposal window-width sweep",
+        "# Proposal maximum-span sweep",
         "",
         "Every condition uses the same shared SAE initialization, optimizer-step "
-        "count, residual-position count, and pool of sequences with at least "
-        f"{max(cfg.proposal.window_sizes)} valid tokens. The new architecture "
-        "uses every context position, so context-target pair counts are reported "
-        "rather than artificially subsampled to equality.",
+        "count, random-pair batch, endpoint-reconstruction count, and long-sequence "
+        "pool. W is the maximum sampled span length, not a stored window boundary. "
+        "Span length is uniform in 2..W and one context is sampled per endpoint.",
         "",
-        "| W | Batch windows | Contexts/window | Total residual positions | "
-        "Total endpoint reconstructions | Total context-target pairs | FVE | "
-        "Cosine | Alive | L0 | Forecast cosine (h=1..7) | "
-        "True-shuffled (1..7) |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Max span W | Pair batch | Horizon support | Total sampled pairs | "
+        "Total endpoint reconstructions | FVE | Cosine | Alive | L0 | "
+        "Forecast cosine (common h) | True-shuffled (common h) |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for window_size in cfg.proposal.window_sizes:
         label = f"proposal_w{window_size:03d}"
@@ -128,11 +126,10 @@ def build_window_sweep_report(cfg: ExperimentConfig) -> Path:
             + " | ".join(
                 [
                     str(window_size),
-                    str(budget["batch_windows"]),
-                    str(budget["context_positions_per_window"]),
-                    str(budget["total_residual_positions"]),
+                    str(budget["pair_batch_size"]),
+                    f"1..{budget['maximum_horizon']}",
+                    str(budget["total_sampled_pairs"]),
                     str(budget["total_endpoint_reconstructions"]),
-                    str(budget["total_context_target_pairs"]),
                     _number(common["fve"]),
                     _number(common["cosine_similarity"]),
                     _number(common["fraction_alive"]),
@@ -163,9 +160,9 @@ def build_window_sweep_report(cfg: ExperimentConfig) -> Path:
     lines.extend(
         [
             "",
-            "The table compares the common forecast horizons 1..7, where "
-            "`h = (W - 1) - context_position`. All-horizon means and "
-            "position-wise results are retained in "
+            f"The table compares the common forecast horizons 1.."
+            f"{min(cfg.proposal.window_sizes) - 1}. All-horizon means and "
+            "horizon-wise results are retained in "
             "`evaluation/window_sweep.json`.",
             "",
         ]
@@ -214,13 +211,13 @@ def build_controlled_report(cfg: ExperimentConfig) -> Path:
         "",
         "The Pythia-160m layer-8, 16k-feature, k=20 configuration follows the "
         "Temporal SAE paper's principal Pythia setup. Standard uses global "
-        "token-wise Top-K; the hierarchical proposal uses independent high/low "
+        "token-wise Top-K; the random-pair proposal uses independent high/low "
         "Top-K budgets; Temporal SAE uses BatchTopK training.",
         "",
         "## Controlled branch-training budget",
         "",
-        "| Method | Windows/step | Residual positions/step | Reconstruction "
-        "targets/step | Predictive pairs/step | Total residual positions |",
+        "| Method | Pair batch | Residual values/step | Reconstruction "
+        "targets/step | Predictive pairs/step | Total reconstruction targets |",
         "|---|---:|---:|---:|---:|---:|",
     ]
     total_tokens = experiment["total_reconstruction_tokens_per_method"]
@@ -236,10 +233,10 @@ def build_controlled_report(cfg: ExperimentConfig) -> Path:
     for window_size in cfg.proposal.window_sizes:
             budget = cfg.proposal.sweep_budget(window_size)
             lines.append(
-                f"| Proposal W={window_size} | {budget['batch_windows']} | "
-                f"{budget['residual_positions_per_step']} | "
+                f"| Proposal W={window_size} | {budget['pair_batch_size']} | "
+                f"{budget['residual_values_per_step']} | "
                 f"{budget['endpoint_reconstructions_per_step']} | "
-                f"{budget['context_target_pairs_per_step']} | {total_tokens:,} |"
+                f"{budget['sampled_pairs_per_step']} | {total_tokens:,} |"
             )
     lines.extend(
         [

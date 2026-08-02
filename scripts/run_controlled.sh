@@ -9,7 +9,7 @@ RUN_DIR_OVERRIDE="${RUN_DIR_OVERRIDE:-}"
 STANDARD_STEPS="${STANDARD_STEPS:-}"
 BRANCH_STEPS="${BRANCH_STEPS:-}"
 WARMUP_STEPS="${WARMUP_STEPS:-}"
-PREDICTOR_WARMUP_STEPS="${PREDICTOR_WARMUP_STEPS:-}"
+SAE_WARMUP_STEPS="${SAE_WARMUP_STEPS:-}"
 PREDICTION_RAMP_STEPS="${PREDICTION_RAMP_STEPS:-}"
 
 python -m sae_comp.cuda_check
@@ -25,8 +25,8 @@ args=(
 [[ -n "$STANDARD_STEPS" ]] && args+=(--standard-steps "$STANDARD_STEPS")
 [[ -n "$BRANCH_STEPS" ]] && args+=(--branch-steps "$BRANCH_STEPS")
 [[ -n "$WARMUP_STEPS" ]] && args+=(--warmup-steps "$WARMUP_STEPS")
-[[ -n "$PREDICTOR_WARMUP_STEPS" ]] && args+=(
-  --predictor-warmup-steps "$PREDICTOR_WARMUP_STEPS"
+[[ -n "$SAE_WARMUP_STEPS" ]] && args+=(
+  --sae-warmup-steps "$SAE_WARMUP_STEPS"
 )
 [[ -n "$PREDICTION_RAMP_STEPS" ]] && args+=(
   --prediction-ramp-steps "$PREDICTION_RAMP_STEPS"

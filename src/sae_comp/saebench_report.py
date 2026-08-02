@@ -417,10 +417,10 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
         f"- Branch training: {cfg.train.branch_steps:,} steps for every condition",
         (
             "- Compared conditions: Standard Top-K SAE, Temporal SAE, and proposal "
-            "W=16, W=32, W=64"
+            + ", ".join(f"W={value}" for value in cfg.proposal.window_sizes)
         ),
         (
-            f"- Proposal architecture: hierarchical high/low fixed-endpoint JEPA; "
+            f"- Proposal architecture: high/low random-pair horizon JEPA; "
             f"high={cfg.proposal.high_fraction:.0%}, "
             f"low={1 - cfg.proposal.high_fraction:.0%}, independent group Top-K"
         ),
@@ -432,10 +432,11 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
         "- Explicitly excluded SAEBench evaluations: SCR and TPP",
         "",
         (
-            "Every proposal width uses the same optimizer-step and residual-position "
-            "budget. The architecture uses all W-1 contexts, so pair counts vary with "
-            "W and each prediction loss is averaged over its pairs. All five "
-            "conditions use the same SAEBench settings."
+            "Every proposal width uses the same optimizer-step, sampled-pair, and "
+            "endpoint-reconstruction budget. W is the maximum random span length; "
+            "the latent prediction loss is inverse-probability weighted so every "
+            "supported horizon has equal expected mass. All conditions use the same "
+            "SAEBench settings."
         ),
         "",
     ]
