@@ -25,8 +25,8 @@ class DataConfig:
     split: str = "train"
     text_field: str = "text"
     sequence_length: int = 128
-    min_valid_tokens: int = 32
-    burn_in_tokens: int = 16
+    min_valid_tokens: int = 64
+    burn_in_tokens: int = 32
     train_sequences: int = 40_960
     validation_sequences: int = 1_024
     shard_sequences: int = 256
@@ -60,8 +60,7 @@ class TrainConfig:
     gradient_accumulation_steps: int = 1
     standard_lr: float = 2e-4
     temporal_lr: float = 2e-4
-    proposal_sae_lr: float = 1e-4
-    proposal_predictor_lr: float = 3e-4
+    proposal_sae_lr: float = 2e-4
     warmup_steps: int = 500
     gradient_clip: float = 1.0
     log_every: int = 100
@@ -71,19 +70,24 @@ class TrainConfig:
 
 @dataclass(frozen=True)
 class ProposalConfig:
-    window_size: int = 16
-    window_sizes: tuple[int, ...] = (2, 4, 8, 16)
+    window_size: int = 32
+    window_sizes: tuple[int, ...] = (2, 4, 8, 16, 32)
     min_span_length: int = 2
     sweep_pairs_per_step: int = 512
     high_fraction: float = 0.2
-    high_reconstruction_weight: float = 0.2
-    predictor_width: int = 256
-    predictor_expansion: int = 2
-    sae_warmup_steps: int = 2_000
-    prediction_ramp_steps: int = 800
-    prediction_weight: float = 1.0
-    horizon_weighting: str = "inverse_probability"
-    ema_decay: float = 0.996
+    low_k: int = 20
+    high_reconstruction_weight: float = 0.1
+    rgg_p: float = 1.0
+    target_active_fraction: float = 0.025
+    target_sigma: float = 0.0
+    invariance_weight: float = 1.0
+    rdm_weight: float = 5.0
+    rdm_projections: int = 1_024
+    rdm_projection_chunk_size: int = 128
+    axis_rdm_features: int = 512
+    axis_rdm_weight: float = 1.0
+    sae_warmup_steps: int = 1_000
+    regularization_ramp_steps: int = 1_000
 
     def sweep_budget(self, window_size: int) -> dict[str, int]:
         return {
@@ -91,9 +95,9 @@ class ProposalConfig:
             "pair_batch_size": self.sweep_pairs_per_step,
             "sampled_pairs_per_step": self.sweep_pairs_per_step,
             "residual_values_per_step": 2 * self.sweep_pairs_per_step,
-            "endpoint_reconstructions_per_step": self.sweep_pairs_per_step,
-            "minimum_horizon": 1,
-            "maximum_horizon": window_size - 1,
+            "reconstructions_per_step": 2 * self.sweep_pairs_per_step,
+            "minimum_distance": 1,
+            "maximum_distance": window_size - 1,
         }
 
 
@@ -154,8 +158,8 @@ class SAEBenchConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    run_dir: str = "runs/paper-pythia160m-random-pair-v3"
-    activation_dir: str = "data/pythia160m-layer8-long-sequences-v2"
+    run_dir: str = "runs/paper-pythia160m-rectified-lpjepa-v4"
+    activation_dir: str = "data/pythia160m-layer8-exchangeable-v3"
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     sae: SAEConfig = field(default_factory=SAEConfig)
@@ -194,11 +198,8 @@ class ExperimentConfig:
                     "sequence_length must be at least every proposal window size"
                 )
             self.proposal.sweep_budget(window_size)
-        if self.sae.k < 2 or self.sae.k > self.sae.dictionary_size:
-            raise ValueError(
-                "sae.k must lie in [2, dictionary_size] so both proposal groups "
-                "receive a positive Top-K budget"
-            )
+        if self.sae.k < 1 or self.sae.k > self.sae.dictionary_size:
+            raise ValueError("sae.k must lie in [1, dictionary_size]")
         if not 0 < self.sae.high_fraction < 1:
             raise ValueError("sae.high_fraction must lie in (0, 1)")
         if not 0 <= self.sae.high_reconstruction_weight <= 1:
@@ -209,6 +210,28 @@ class ExperimentConfig:
             raise ValueError(
                 "proposal.high_reconstruction_weight must lie in [0, 1]"
             )
+        proposal_high = round(
+            self.sae.dictionary_size * self.proposal.high_fraction
+        )
+        proposal_low = self.sae.dictionary_size - proposal_high
+        if not 1 <= self.proposal.low_k <= proposal_low:
+            raise ValueError("proposal.low_k must lie in [1, proposal d_low]")
+        if self.proposal.rgg_p not in {1.0, 2.0}:
+            raise ValueError("proposal.rgg_p must be 1 or 2")
+        if not 0 < self.proposal.target_active_fraction < 1:
+            raise ValueError("proposal.target_active_fraction must lie in (0, 1)")
+        if self.proposal.target_sigma < 0:
+            raise ValueError("proposal.target_sigma must be non-negative")
+        if self.proposal.invariance_weight < 0 or self.proposal.rdm_weight < 0:
+            raise ValueError("proposal regularization weights must be non-negative")
+        if self.proposal.rdm_projections < 1:
+            raise ValueError("proposal.rdm_projections must be positive")
+        if self.proposal.rdm_projection_chunk_size < 1:
+            raise ValueError("proposal.rdm_projection_chunk_size must be positive")
+        if self.proposal.axis_rdm_features < 0:
+            raise ValueError("proposal.axis_rdm_features must be non-negative")
+        if self.proposal.axis_rdm_weight < 0:
+            raise ValueError("proposal.axis_rdm_weight must be non-negative")
         if self.train.standard_steps < 1 or self.train.branch_steps < 1:
             raise ValueError("training step counts must be positive")
         if not 1 <= self.train.temporal_pairs_per_step <= self.train.token_batch_size:
@@ -219,8 +242,8 @@ class ExperimentConfig:
             raise ValueError("sae_warmup_steps must be smaller than branch_steps")
         if self.proposal.sweep_pairs_per_step < 1:
             raise ValueError("sweep_pairs_per_step must be positive")
-        if self.proposal.horizon_weighting not in {"none", "inverse_probability"}:
-            raise ValueError("unsupported proposal.horizon_weighting")
+        if self.proposal.regularization_ramp_steps < 1:
+            raise ValueError("regularization_ramp_steps must be positive")
         if not self.sae_bench.enabled:
             return
         allowed_saebench_evals = {
@@ -325,7 +348,8 @@ def apply_training_overrides(
     branch_steps: int | None = None,
     warmup_steps: int | None = None,
     sae_warmup_steps: int | None = None,
-    prediction_ramp_steps: int | None = None,
+    regularization_ramp_steps: int | None = None,
+    axis_rdm_features: int | None = None,
     run_dir: str | None = None,
 ) -> ExperimentConfig:
     """Resolve runtime training-budget overrides into a validated config.
@@ -340,7 +364,7 @@ def apply_training_overrides(
         raise ValueError("training_scale must be a finite positive number")
 
     def scaled(value: int, *, allow_zero: bool = False) -> int:
-        result = int(round(value * training_scale))
+        result = round(value * training_scale)
         return max(0 if allow_zero else 1, result)
 
     resolved_standard = (
@@ -361,31 +385,40 @@ def apply_training_overrides(
         if sae_warmup_steps is None
         else sae_warmup_steps
     )
-    resolved_prediction_ramp = (
-        scaled(cfg.proposal.prediction_ramp_steps)
-        if prediction_ramp_steps is None
-        else prediction_ramp_steps
+    resolved_regularization_ramp = (
+        scaled(cfg.proposal.regularization_ramp_steps)
+        if regularization_ramp_steps is None
+        else regularization_ramp_steps
     )
     if resolved_standard < 1 or resolved_branch < 1:
         raise ValueError("standard_steps and branch_steps must be positive")
     if resolved_warmup < 0 or resolved_sae_warmup < 0:
         raise ValueError("warmup step counts must be non-negative")
-    if resolved_prediction_ramp < 1:
-        raise ValueError("prediction_ramp_steps must be positive")
+    if resolved_regularization_ramp < 1:
+        raise ValueError("regularization_ramp_steps must be positive")
+    resolved_axis_features = (
+        cfg.proposal.axis_rdm_features
+        if axis_rdm_features is None
+        else axis_rdm_features
+    )
+    if resolved_axis_features < 0:
+        raise ValueError("axis_rdm_features must be non-negative")
 
     base_budget = (
         cfg.train.standard_steps,
         cfg.train.branch_steps,
         cfg.train.warmup_steps,
         cfg.proposal.sae_warmup_steps,
-        cfg.proposal.prediction_ramp_steps,
+        cfg.proposal.regularization_ramp_steps,
+        cfg.proposal.axis_rdm_features,
     )
     resolved_budget = (
         resolved_standard,
         resolved_branch,
         resolved_warmup,
         resolved_sae_warmup,
-        resolved_prediction_ramp,
+        resolved_regularization_ramp,
+        resolved_axis_features,
     )
     budget_changed = resolved_budget != base_budget
 
@@ -400,9 +433,9 @@ def apply_training_overrides(
                     branch_steps,
                     warmup_steps,
                     sae_warmup_steps,
-                    prediction_ramp_steps,
+                    regularization_ramp_steps,
                 )
-            )
+            ) and resolved_axis_features == cfg.proposal.axis_rdm_features
             if only_scaled:
                 scale_tag = f"{training_scale:.8g}".replace(".", "p")
                 suffix = f"trainx{scale_tag}"
@@ -410,7 +443,8 @@ def apply_training_overrides(
                 suffix = (
                     f"budget-s{resolved_standard}-b{resolved_branch}"
                     f"-w{resolved_warmup}-sw{resolved_sae_warmup}"
-                    f"-pr{resolved_prediction_ramp}"
+                    f"-rr{resolved_regularization_ramp}"
+                    f"-axis{resolved_axis_features}"
                 )
             resolved_run_dir = f"{cfg.run_dir}-{suffix}"
 
@@ -426,7 +460,8 @@ def apply_training_overrides(
         proposal=replace(
             cfg.proposal,
             sae_warmup_steps=resolved_sae_warmup,
-            prediction_ramp_steps=resolved_prediction_ramp,
+            regularization_ramp_steps=resolved_regularization_ramp,
+            axis_rdm_features=resolved_axis_features,
         ),
     )
     resolved.validate()

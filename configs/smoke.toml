@@ -1,5 +1,5 @@
-run_dir = "runs/smoke-random-pair-v3"
-activation_dir = "data/smoke-long-v2"
+run_dir = "runs/smoke-rectified-lpjepa-v4"
+activation_dir = "data/smoke-exchangeable-v3"
 
 [model]
 name = "EleutherAI/pythia-70m-deduped"
@@ -13,9 +13,9 @@ dataset_config = "default"
 revision = "fcbfcfde4222cbb1acd1d33bad0be250ee14b1bb"
 split = "train"
 text_field = "text"
-sequence_length = 32
-min_valid_tokens = 24
-burn_in_tokens = 8
+sequence_length = 64
+min_valid_tokens = 64
+burn_in_tokens = 32
 train_sequences = 256
 validation_sequences = 32
 shard_sequences = 32
@@ -46,7 +46,6 @@ gradient_accumulation_steps = 1
 standard_lr = 0.0002
 temporal_lr = 0.0002
 proposal_sae_lr = 0.0001
-proposal_predictor_lr = 0.0003
 warmup_steps = 2
 gradient_clip = 1.0
 log_every = 5
@@ -54,19 +53,24 @@ amp_dtype = "bfloat16"
 device = "cuda"
 
 [proposal]
-window_size = 16
-window_sizes = [2, 4, 8, 16]
+window_size = 32
+window_sizes = [2, 4, 8, 16, 32]
 min_span_length = 2
 sweep_pairs_per_step = 128
 high_fraction = 0.2
-high_reconstruction_weight = 0.2
-predictor_width = 64
-predictor_expansion = 2
+low_k = 20
+high_reconstruction_weight = 0.1
+rgg_p = 1.0
+target_active_fraction = 0.025
+target_sigma = 0.0
+invariance_weight = 1.0
+rdm_weight = 5.0
+rdm_projections = 32
+rdm_projection_chunk_size = 16
+axis_rdm_features = 32
+axis_rdm_weight = 1.0
 sae_warmup_steps = 5
-prediction_ramp_steps = 5
-prediction_weight = 1.0
-horizon_weighting = "inverse_probability"
-ema_decay = 0.996
+regularization_ramp_steps = 5
 
 [evaluation]
 batch_sequences = 4

@@ -59,7 +59,8 @@ def _add_training_override_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--branch-steps", type=int)
     parser.add_argument("--warmup-steps", type=int)
     parser.add_argument("--sae-warmup-steps", type=int)
-    parser.add_argument("--prediction-ramp-steps", type=int)
+    parser.add_argument("--regularization-ramp-steps", type=int)
+    parser.add_argument("--axis-rdm-features", type=int)
     parser.add_argument(
         "--run-dir",
         help=(
@@ -71,7 +72,7 @@ def _add_training_override_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compare standard, temporal, and transition-JEPA SAEs"
+        description="Compare standard, temporal, and Rectified LpJEPA SAEs"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command, _ in STAGES:
@@ -100,7 +101,8 @@ def main() -> None:
         branch_steps=args.branch_steps,
         warmup_steps=args.warmup_steps,
         sae_warmup_steps=args.sae_warmup_steps,
-        prediction_ramp_steps=args.prediction_ramp_steps,
+        regularization_ramp_steps=args.regularization_ramp_steps,
+        axis_rdm_features=args.axis_rdm_features,
         run_dir=args.run_dir,
     )
     print(
@@ -109,7 +111,8 @@ def main() -> None:
         f"branch={cfg.train.branch_steps} steps, "
         f"warmup={cfg.train.warmup_steps}, "
         f"sae_warmup={cfg.proposal.sae_warmup_steps}, "
-        f"prediction_ramp={cfg.proposal.prediction_ramp_steps}, "
+        f"regularization_ramp={cfg.proposal.regularization_ramp_steps}, "
+        f"axis_rdm_features={cfg.proposal.axis_rdm_features}, "
         f"run_dir={cfg.run_dir}"
     )
     if args.command == "extract":

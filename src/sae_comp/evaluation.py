@@ -13,17 +13,21 @@ from .activations import ActivationStore
 from .config import ExperimentConfig
 from .models import (
     PROPOSAL_ARCHITECTURE_ID,
+    RectifiedLpJEPAConfig,
+    RectifiedLpJEPASAE,
     SparseAutoencoder,
     SparseAutoencoderConfig,
-    TransitionJEPA,
-    TransitionJEPAConfig,
 )
 from .training import load_checkpoint
 
 
 def load_method(
     checkpoint_path: str | Path, device: torch.device
-) -> tuple[SparseAutoencoder, TransitionJEPA | None, str]:
+) -> tuple[
+    SparseAutoencoder | RectifiedLpJEPASAE,
+    RectifiedLpJEPASAE | None,
+    str,
+]:
     checkpoint = load_checkpoint(checkpoint_path)
     method = checkpoint["method"]
     raw = checkpoint["model_config"]
@@ -34,20 +38,11 @@ def load_method(
                 "proposal checkpoint uses an obsolete architecture; rerun "
                 "`sae-comp train-window-sweep` with the current code"
             )
-        proposal_cfg = TransitionJEPAConfig(**raw)
-        sae_cfg = SparseAutoencoderConfig(
-            d_in=proposal_cfg.d_in,
-            d_sae=proposal_cfg.d_sae,
-            k=proposal_cfg.k,
-            high_fraction=proposal_cfg.high_fraction,
-        )
-        initialized = SparseAutoencoder(sae_cfg)
-        proposal = TransitionJEPA(proposal_cfg, initialized).to(device)
+        proposal_cfg = RectifiedLpJEPAConfig(**raw)
+        proposal = RectifiedLpJEPASAE(proposal_cfg).to(device)
         proposal.load_state_dict(checkpoint["state_dict"])
         proposal.eval()
-        final_sae = proposal.final_ema_sae()
-        final_sae.eval()
-        return final_sae, proposal, method
+        return proposal, proposal, method
     sae_cfg = SparseAutoencoderConfig(**raw)
     sae = SparseAutoencoder(sae_cfg).to(device)
     sae.load_state_dict(checkpoint["state_dict"])
@@ -184,7 +179,7 @@ def evaluate_method(
             values = sequence_metrics(x, features)
             for name, value in values.items():
                 smooth_sums["full"][name] += value
-            if method == "temporal":
+            if method in {"temporal", "proposal"}:
                 for split, selected in (
                     ("high", features[:, :high]),
                     ("low", features[:, high:]),
@@ -200,7 +195,7 @@ def evaluate_method(
     smoothness = {
         split: {name: value / max(sequences, 1) for name, value in metrics.items()}
         for split, metrics in smooth_sums.items()
-        if split == "full" or method == "temporal"
+        if split == "full" or method in {"temporal", "proposal"}
     }
     return {
         "method": method,
@@ -215,7 +210,7 @@ def evaluate_method(
 
 
 @torch.inference_mode()
-def evaluate_proposal_forecast(
+def evaluate_proposal_views(
     checkpoint_path: str | Path,
     cfg: ExperimentConfig,
     minimum_sequence_length: int | None = None,
@@ -224,18 +219,22 @@ def evaluate_proposal_forecast(
     device = torch.device(cfg.train.device)
     _, proposal, method = load_method(checkpoint_path, device)
     if proposal is None:
-        raise ValueError("proposal forecast requires a proposal checkpoint")
+        raise ValueError("shared-view evaluation requires a proposal checkpoint")
     store = ActivationStore(Path(cfg.activation_dir) / "manifest.json", cfg.train.seed)
-    max_horizon = proposal.cfg.window_size - 1
-    cosine_sum = torch.zeros(max_horizon + 1, device=device)
-    shuffled_sum = torch.zeros(max_horizon + 1, device=device)
-    horizon_only_sum = torch.zeros(max_horizon + 1, device=device)
-    normalized_mse_sum = torch.zeros(max_horizon + 1, device=device)
-    horizon_counts = torch.zeros(max_horizon + 1, device=device)
+    max_distance = proposal.cfg.max_span_length - 1
+    cosine_sum = torch.zeros(max_distance + 1, device=device)
+    shuffled_sum = torch.zeros(max_distance + 1, device=device)
+    low_cosine_sum = torch.zeros(max_distance + 1, device=device)
+    swap_error = torch.zeros(max_distance + 1, device=device)
+    shuffled_swap_error = torch.zeros(max_distance + 1, device=device)
+    centered_energy = torch.zeros(max_distance + 1, device=device)
+    distance_counts = torch.zeros(max_distance + 1, device=device)
     count = 0
-    iterator = store.random_pair_batches(
+    active_high = 0
+    high_values = 0
+    iterator = store.random_view_pair_batches(
         cfg.train.window_batch_size,
-        max_span_length=proposal.cfg.window_size,
+        max_span_length=proposal.cfg.max_span_length,
         min_span_length=cfg.proposal.min_span_length,
         boundary_max_horizon=max(cfg.proposal.window_sizes) - 1,
         split="validation",
@@ -245,71 +244,90 @@ def evaluate_proposal_forecast(
             key: value.to(device)
             for key, value in next(iterator).items()
         }
-        output = proposal(
-            batch["context"], batch["target"], batch["horizon"]
+        output = proposal(batch["view_a"], batch["view_b"])
+        active_high += int((output["high_a"] > 0).sum())
+        active_high += int((output["high_b"] > 0).sum())
+        high_values += output["high_a"].numel() + output["high_b"].numel()
+        permutation = torch.roll(
+            torch.arange(len(batch["view_a"]), device=device), 1
         )
-        targets = output["target_codes"]
-        prediction = output["predicted_codes"]
-        context = output["context_codes"]
-        permutation = torch.roll(torch.arange(len(context), device=device), 1)
-        shuffled = proposal.predict_from_code(
-            context[permutation], batch["horizon"]
+        high_cosine = F.cosine_similarity(
+            output["high_a"].float(), output["high_b"].float(), dim=-1
         )
-        horizon_only = proposal.predict_from_code(
-            context, batch["horizon"], use_context=False
+        shuffled_cosine = F.cosine_similarity(
+            output["high_a"].float(),
+            output["high_b"].index_select(0, permutation).float(),
+            dim=-1,
         )
-        horizon = batch["horizon"]
-        ones = torch.ones_like(horizon, dtype=torch.float32)
-        horizon_counts.index_add_(0, horizon, ones)
+        low_cosine = F.cosine_similarity(
+            output["low_a"].float(), output["low_b"].float(), dim=-1
+        )
+        swap_a = proposal.decode_high(output["high_b"]) + proposal.decode_low(
+            output["low_a"]
+        )
+        swap_b = proposal.decode_high(output["high_a"]) + proposal.decode_low(
+            output["low_b"]
+        )
+        shuffled_swap_a = proposal.decode_high(
+            output["high_b"].index_select(0, permutation)
+        ) + proposal.decode_low(output["low_a"])
+        shuffled_swap_b = proposal.decode_high(
+            output["high_a"].index_select(0, permutation)
+        ) + proposal.decode_low(output["low_b"])
+        per_pair_energy = (
+            (batch["view_a"] - proposal.pre_bias).float().square().sum(dim=-1)
+            + (batch["view_b"] - proposal.pre_bias).float().square().sum(dim=-1)
+        )
+        per_pair_swap_error = (
+            (swap_a - batch["view_a"]).float().square().sum(dim=-1)
+            + (swap_b - batch["view_b"]).float().square().sum(dim=-1)
+        )
+        per_pair_shuffled_swap_error = (
+            (shuffled_swap_a - batch["view_a"]).float().square().sum(dim=-1)
+            + (shuffled_swap_b - batch["view_b"]).float().square().sum(dim=-1)
+        )
+        distance = batch["distance"]
+        ones = torch.ones_like(distance, dtype=torch.float32)
+        distance_counts.index_add_(0, distance, ones)
         cosine_sum.index_add_(
-            0, horizon, F.cosine_similarity(prediction, targets, dim=-1)
+            0, distance, high_cosine
         )
-        shuffled_sum.index_add_(
-            0, horizon, F.cosine_similarity(shuffled, targets, dim=-1)
-        )
-        horizon_only_sum.index_add_(
-            0, horizon, F.cosine_similarity(horizon_only, targets, dim=-1)
-        )
-        energy = targets.float().square().mean(dim=-1).clamp_min(1e-8)
-        normalized_mse_sum.index_add_(
-            0,
-            horizon,
-            (prediction - targets).float().square().mean(dim=-1) / energy,
-        )
-        count += len(horizon)
-    denominator = horizon_counts.clamp_min(1)
+        shuffled_sum.index_add_(0, distance, shuffled_cosine)
+        low_cosine_sum.index_add_(0, distance, low_cosine)
+        swap_error.index_add_(0, distance, per_pair_swap_error)
+        shuffled_swap_error.index_add_(0, distance, per_pair_shuffled_swap_error)
+        centered_energy.index_add_(0, distance, per_pair_energy)
+        count += len(distance)
+    denominator = distance_counts.clamp_min(1)
     cosine = cosine_sum / denominator
     shuffled = shuffled_sum / denominator
-    horizon_only = horizon_only_sum / denominator
-    normalized_mse = normalized_mse_sum / denominator
+    low_cosine = low_cosine_sum / denominator
+    swap_fvu = swap_error / centered_energy.clamp_min(1e-8)
+    shuffled_swap_fvu = shuffled_swap_error / centered_energy.clamp_min(1e-8)
+    valid = distance_counts[1:] > 0
     return {
         "method": method,
         "pairs": count,
-        "offsets": [
+        "distances": [
             {
-                "offset": horizon,
-                "horizon": horizon,
-                "code_cosine": float(cosine[horizon]),
-                "shuffled_code_cosine": float(shuffled[horizon]),
-                "horizon_only_code_cosine": float(horizon_only[horizon]),
-                "true_minus_shuffled": float(
-                    cosine[horizon] - shuffled[horizon]
-                ),
-                "true_minus_horizon_only": float(
-                    cosine[horizon] - horizon_only[horizon]
-                ),
-                "normalized_mse": float(normalized_mse[horizon]),
-                "pairs": int(horizon_counts[horizon]),
+                "distance": distance,
+                "high_cosine": float(cosine[distance]),
+                "shuffled_high_cosine": float(shuffled[distance]),
+                "high_margin": float(cosine[distance] - shuffled[distance]),
+                "low_cosine": float(low_cosine[distance]),
+                "swap_fvu": float(swap_fvu[distance]),
+                "shuffled_swap_fvu": float(shuffled_swap_fvu[distance]),
+                "pairs": int(distance_counts[distance]),
             }
-            for horizon in range(1, max_horizon + 1)
+            for distance in range(1, max_distance + 1)
         ],
-        "mean_code_cosine": float(cosine[1:].mean()),
-        "mean_true_minus_shuffled": float(
-            (cosine[1:] - shuffled[1:]).mean()
+        "mean_high_cosine": float(cosine[1:][valid].mean()),
+        "mean_high_margin": float((cosine[1:] - shuffled[1:])[valid].mean()),
+        "swap_fvu": float(swap_error.sum() / centered_energy.sum().clamp_min(1e-8)),
+        "shuffled_swap_fvu": float(
+            shuffled_swap_error.sum() / centered_energy.sum().clamp_min(1e-8)
         ),
-        "mean_true_minus_horizon_only": float(
-            (cosine[1:] - horizon_only[1:]).mean()
-        ),
+        "high_active_fraction": active_high / max(high_values, 1),
     }
 
 
@@ -320,8 +338,8 @@ def evaluate_all(cfg: ExperimentConfig) -> dict[str, Any]:
         for name in ("standard", "temporal", "proposal")
     }
     common = {name: evaluate_method(path, cfg) for name, path in checkpoints.items()}
-    forecast = evaluate_proposal_forecast(checkpoints["proposal"], cfg)
-    results = {"common": common, "proposal_forecast": forecast}
+    views = evaluate_proposal_views(checkpoints["proposal"], cfg)
+    results = {"common": common, "proposal_views": views}
     output_dir = run_dir / "evaluation"
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "metrics.json").write_text(
@@ -357,35 +375,35 @@ def evaluate_all(cfg: ExperimentConfig) -> dict[str, Any]:
     return results
 
 
-def _summarize_common_forecast_horizon(
-    forecast: dict[str, Any], common_horizon: int
+def _summarize_common_distance(
+    views: dict[str, Any], common_distance: int
 ) -> dict[str, Any]:
-    common_offsets = forecast["offsets"][:common_horizon]
-    forecast["common_horizon_max_offset"] = common_horizon
-    forecast["common_horizon_mean_code_cosine"] = sum(
-        item["code_cosine"] for item in common_offsets
-    ) / len(common_offsets)
-    forecast["common_horizon_mean_true_minus_shuffled"] = sum(
-        item["true_minus_shuffled"] for item in common_offsets
-    ) / len(common_offsets)
-    return forecast
+    common_rows = views["distances"][:common_distance]
+    views["common_max_distance"] = common_distance
+    views["common_mean_high_cosine"] = sum(
+        item["high_cosine"] for item in common_rows
+    ) / len(common_rows)
+    views["common_mean_high_margin"] = sum(
+        item["high_margin"] for item in common_rows
+    ) / len(common_rows)
+    return views
 
 
 def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
     run_dir = Path(cfg.run_dir)
     maximum_window = max(cfg.proposal.window_sizes)
-    common_horizon = min(cfg.proposal.window_sizes) - 1
+    common_distance = min(cfg.proposal.window_sizes) - 1
     results: dict[str, Any] = {}
     for window_size in cfg.proposal.window_sizes:
         label = f"proposal_w{window_size:03d}"
         path = run_dir / "checkpoints" / f"{label}.pt"
         budget = cfg.proposal.sweep_budget(window_size)
-        forecast = evaluate_proposal_forecast(
+        views = evaluate_proposal_views(
             path,
             cfg,
             minimum_sequence_length=maximum_window,
         )
-        forecast = _summarize_common_forecast_horizon(forecast, common_horizon)
+        views = _summarize_common_distance(views, common_distance)
         results[label] = {
             "window_size": window_size,
             "training_budget": {
@@ -394,8 +412,8 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
                 "total_residual_values": (
                     budget["residual_values_per_step"] * cfg.train.branch_steps
                 ),
-                "total_endpoint_reconstructions": (
-                    budget["endpoint_reconstructions_per_step"]
+                "total_reconstructions": (
+                    budget["reconstructions_per_step"]
                     * cfg.train.branch_steps
                 ),
                 "total_sampled_pairs": (
@@ -404,7 +422,7 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
                 ),
             },
             "common": evaluate_method(path, cfg),
-            "forecast": forecast,
+            "views": views,
         }
 
     output_dir = run_dir / "evaluation"
@@ -421,7 +439,7 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
             "pair_batch_size",
             "optimizer_steps",
             "total_residual_values",
-            "total_endpoint_reconstructions",
+            "total_reconstructions",
             "total_sampled_pairs",
             "fve",
             "cosine_similarity",
@@ -431,10 +449,12 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
             "fourier",
             "wavelet",
             "multiscale",
-            "common_horizon_forecast_code_cosine",
-            "common_horizon_forecast_true_minus_shuffled",
-            "all_offsets_forecast_code_cosine",
-            "all_offsets_forecast_true_minus_shuffled",
+            "common_distance_high_cosine",
+            "common_distance_high_margin",
+            "all_distances_high_cosine",
+            "all_distances_high_margin",
+            "swap_fvu",
+            "shuffled_swap_fvu",
         ]
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
@@ -450,8 +470,8 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
                     "total_residual_values": budget[
                         "total_residual_values"
                     ],
-                    "total_endpoint_reconstructions": budget[
-                        "total_endpoint_reconstructions"
+                    "total_reconstructions": budget[
+                        "total_reconstructions"
                     ],
                     "total_sampled_pairs": budget[
                         "total_sampled_pairs"
@@ -461,18 +481,20 @@ def evaluate_window_sweep(cfg: ExperimentConfig) -> dict[str, Any]:
                     "fraction_alive": common["fraction_alive"],
                     "l0": common["l0"],
                     **common["smoothness"]["full"],
-                    "common_horizon_forecast_code_cosine": values["forecast"][
-                        "common_horizon_mean_code_cosine"
+                    "common_distance_high_cosine": values["views"][
+                        "common_mean_high_cosine"
                     ],
-                    "common_horizon_forecast_true_minus_shuffled": values["forecast"][
-                        "common_horizon_mean_true_minus_shuffled"
+                    "common_distance_high_margin": values["views"][
+                        "common_mean_high_margin"
                     ],
-                    "all_offsets_forecast_code_cosine": values["forecast"][
-                        "mean_code_cosine"
+                    "all_distances_high_cosine": values["views"][
+                        "mean_high_cosine"
                     ],
-                    "all_offsets_forecast_true_minus_shuffled": values["forecast"][
-                        "mean_true_minus_shuffled"
+                    "all_distances_high_margin": values["views"][
+                        "mean_high_margin"
                     ],
+                    "swap_fvu": values["views"]["swap_fvu"],
+                    "shuffled_swap_fvu": values["views"]["shuffled_swap_fvu"],
                 }
             )
     return results
@@ -499,7 +521,7 @@ def evaluate_controlled_comparison(cfg: ExperimentConfig) -> dict[str, Any]:
     minimum_sequence_length = (
         cfg.data.burn_in_tokens + max(cfg.proposal.window_sizes)
     )
-    common_horizon = min(cfg.proposal.window_sizes) - 1
+    common_distance = min(cfg.proposal.window_sizes) - 1
     checkpoints = controlled_checkpoint_paths(cfg)
     methods = {
         label: evaluate_method(
@@ -509,15 +531,15 @@ def evaluate_controlled_comparison(cfg: ExperimentConfig) -> dict[str, Any]:
         )
         for label, path in checkpoints.items()
     }
-    forecasts = {}
+    views = {}
     for window_size in cfg.proposal.window_sizes:
         label = f"proposal_w{window_size:03d}"
-        forecast = evaluate_proposal_forecast(
+        view_metrics = evaluate_proposal_views(
             checkpoints[label],
             cfg,
             minimum_sequence_length=minimum_sequence_length,
         )
-        forecasts[label] = _summarize_common_forecast_horizon(forecast, common_horizon)
+        views[label] = _summarize_common_distance(view_metrics, common_distance)
     results = {
         "experiment": {
             "model": cfg.model.name,
@@ -538,7 +560,7 @@ def evaluate_controlled_comparison(cfg: ExperimentConfig) -> dict[str, Any]:
             ),
         },
         "methods": methods,
-        "proposal_forecasts": forecasts,
+        "proposal_views": views,
     }
     output_dir = Path(cfg.run_dir) / "evaluation"
     output_dir.mkdir(parents=True, exist_ok=True)

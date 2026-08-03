@@ -12,18 +12,19 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_smoke_config_loads() -> None:
     cfg = load_config(ROOT / "configs" / "smoke.toml")
     assert cfg.model.layer == 3
-    assert cfg.proposal.window_size == 16
-    assert cfg.proposal.window_sizes == [2, 4, 8, 16]
+    assert cfg.proposal.window_size == 32
+    assert cfg.proposal.window_sizes == [2, 4, 8, 16, 32]
     assert cfg.proposal.high_fraction == 0.2
-    assert cfg.proposal.high_reconstruction_weight == 0.2
+    assert cfg.proposal.high_reconstruction_weight == 0.1
+    assert cfg.proposal.axis_rdm_features == 32
     assert cfg.proposal.sweep_budget(2) == {
         "window_size": 2,
         "pair_batch_size": 128,
         "sampled_pairs_per_step": 128,
         "residual_values_per_step": 256,
-        "endpoint_reconstructions_per_step": 128,
-        "minimum_horizon": 1,
-        "maximum_horizon": 1,
+        "reconstructions_per_step": 256,
+        "minimum_distance": 1,
+        "maximum_distance": 1,
     }
     assert cfg.sae.dictionary_size == 2048
     assert len(cfg.fingerprint()) == 64
@@ -31,7 +32,7 @@ def test_smoke_config_loads() -> None:
 
 def test_config_rejects_window_larger_than_sequence(tmp_path: Path) -> None:
     source = (ROOT / "configs" / "smoke.toml").read_text(encoding="utf-8")
-    source = source.replace("sequence_length = 32", "sequence_length = 8")
+    source = source.replace("sequence_length = 64", "sequence_length = 8")
     path = tmp_path / "invalid.toml"
     path.write_text(source, encoding="utf-8")
     with pytest.raises(ValueError, match="sequence_length"):
@@ -44,12 +45,13 @@ def test_controlled_sweep_has_equal_training_volume() -> None:
         cfg.proposal.sweep_budget(window_size)
         for window_size in cfg.proposal.window_sizes
     ]
-    assert cfg.proposal.window_sizes == [2, 4, 8, 16]
+    assert cfg.proposal.window_sizes == [2, 4, 8, 16, 32]
     assert {item["pair_batch_size"] for item in budgets} == {512}
     assert {item["residual_values_per_step"] for item in budgets} == {1024}
-    assert {item["endpoint_reconstructions_per_step"] for item in budgets} == {512}
+    assert {item["reconstructions_per_step"] for item in budgets} == {1024}
     assert {item["sampled_pairs_per_step"] for item in budgets} == {512}
-    assert [item["maximum_horizon"] for item in budgets] == [1, 3, 7, 15]
+    assert [item["maximum_distance"] for item in budgets] == [1, 3, 7, 15, 31]
+    assert cfg.proposal.axis_rdm_features == 512
     assert cfg.train.temporal_pairs_per_step == 448
 
 
@@ -59,8 +61,8 @@ def test_training_scale_updates_steps_schedules_and_run_directory() -> None:
     assert scaled.train.standard_steps == 24_000
     assert scaled.train.branch_steps == 12_000
     assert scaled.train.warmup_steps == 1_000
-    assert scaled.proposal.sae_warmup_steps == 4_000
-    assert scaled.proposal.prediction_ramp_steps == 2_000
+    assert scaled.proposal.sae_warmup_steps == 2_000
+    assert scaled.proposal.regularization_ramp_steps == 2_000
     assert scaled.train.token_batch_size == cfg.train.token_batch_size
     assert scaled.proposal.sweep_pairs_per_step == 512
     assert scaled.run_dir == f"{cfg.run_dir}-trainx2"
@@ -81,7 +83,7 @@ def test_explicit_training_steps_override_scale_and_can_set_run_directory() -> N
     assert resolved.train.branch_steps == 15_000
     assert resolved.train.warmup_steps == 1_000
     assert resolved.proposal.sae_warmup_steps == 2_000
-    assert resolved.proposal.prediction_ramp_steps == 2_000
+    assert resolved.proposal.regularization_ramp_steps == 2_000
     assert resolved.run_dir == "runs/custom-budget"
 
 
@@ -93,7 +95,7 @@ def test_custom_budget_gets_deterministic_suffix() -> None:
         branch_steps=9_000,
     )
     assert resolved.run_dir.endswith(
-        "-budget-s18000-b9000-w500-sw2000-pr1000"
+        "-budget-s18000-b9000-w500-sw1000-rr1000-axis512"
     )
 
 
@@ -116,8 +118,11 @@ def test_cli_accepts_training_budget_overrides() -> None:
             "15000",
             "--run-dir",
             "runs/custom",
+            "--axis-rdm-features",
+            "256",
         ]
     )
     assert args.training_scale == 2
     assert args.branch_steps == 15_000
     assert args.run_dir == "runs/custom"
+    assert args.axis_rdm_features == 256

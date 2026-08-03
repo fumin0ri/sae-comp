@@ -6,13 +6,20 @@ import pytest
 import torch
 
 from sae_comp.config import load_config
-from sae_comp.models import SparseAutoencoder, SparseAutoencoderConfig
+from sae_comp.models import (
+    RectifiedLpJEPAConfig,
+    RectifiedLpJEPASAE,
+    SparseAutoencoder,
+    SparseAutoencoderConfig,
+)
 from sae_comp.saebench import (
     AdapterConfig,
     SAEBenchAdapter,
     _ravel_protocol_mismatch,
+    checkpoint_to_saebench,
 )
 from sae_comp.saebench_report import build_saebench_report, collect_saebench_summary
+from sae_comp.training import _save_checkpoint
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,8 +35,10 @@ def _adapter(sae: SparseAutoencoder, *, temporal: bool) -> SAEBenchAdapter:
         threshold=sae.threshold.detach(),
         use_threshold=temporal,
         use_group_topk=sae.cfg.group_topk,
+        use_rectified_groups=False,
         group_high_size=sae.cfg.group_high_size,
         group_high_k=sae.cfg.group_high_k,
+        group_low_k=sae.cfg.group_low_k,
         k=sae.cfg.k,
         cfg=AdapterConfig(
             model_name="pythia-160m-deduped",
@@ -84,6 +93,31 @@ def test_saebench_adapter_preserves_grouped_topk(shape: tuple[int, ...]) -> None
     assert adapter.use_group_topk
 
 
+def test_saebench_adapter_preserves_rectified_high_and_topk_low(tmp_path) -> None:
+    cfg = load_config(ROOT / "configs" / "controlled_rtx4090.toml")
+    model_cfg = RectifiedLpJEPAConfig(
+        d_in=12, d_sae=20, low_k=4, max_span_length=4
+    )
+    model = RectifiedLpJEPASAE(model_cfg)
+    model.initialize_normalization(torch.randn(12), 1.7)
+    checkpoint = tmp_path / "proposal.pt"
+    _save_checkpoint(
+        checkpoint,
+        "proposal",
+        model,
+        vars(model_cfg),
+        cfg,
+        {"config_fingerprint": "activation-test"},
+    )
+    adapter = checkpoint_to_saebench(checkpoint, "proposal_w004", cfg)
+    values = torch.randn(7, 12)
+    code = model.encode(values)
+    torch.testing.assert_close(adapter.encode(values), code * 1.7)
+    torch.testing.assert_close(adapter(values), model.decode(code))
+    assert adapter.use_rectified_groups
+    assert not adapter.use_group_topk
+
+
 def test_controlled_config_enables_only_allowlisted_saebench_evals() -> None:
     cfg = load_config(ROOT / "configs" / "controlled_rtx4090.toml")
     assert cfg.sae_bench.enabled
@@ -97,7 +131,7 @@ def test_controlled_config_enables_only_allowlisted_saebench_evals() -> None:
     assert cfg.sae_bench.ravel_entity_attribute_selection == {
         "city": ["Country", "Continent", "Language"]
     }
-    assert cfg.proposal.window_sizes == [2, 4, 8, 16]
+    assert cfg.proposal.window_sizes == [2, 4, 8, 16, 32]
 
 
 def test_controlled_config_rejects_scr_or_tpp(tmp_path: Path) -> None:
@@ -154,6 +188,7 @@ def test_saebench_summary_reads_official_result_shape(tmp_path: Path) -> None:
         "proposal_w004",
         "proposal_w008",
         "proposal_w016",
+        "proposal_w032",
     ]
     fixtures = {
         "core": {
@@ -228,6 +263,7 @@ def test_partial_saebench_report_uses_available_results(tmp_path: Path) -> None:
         "proposal_w004",
         "proposal_w008",
         "proposal_w016",
+        "proposal_w032",
     ]
     for label in labels:
         (output_dir / f"{label}_custom_sae_eval_results.json").write_text(
@@ -238,10 +274,10 @@ def test_partial_saebench_report_uses_available_results(tmp_path: Path) -> None:
     summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
     report_text = report.read_text(encoding="utf-8")
     assert summary["completed_eval_types"] == ["core"]
-    assert len(summary["missing_results"]) == 18
+    assert len(summary["missing_results"]) == 21
     assert "**Partial report:**" in report_text
-    assert "| `core` | 6/6 | - |" in report_text
-    assert "| `sparse_probing` | 0/6 |" in report_text
+    assert "| `core` | 7/7 | - |" in report_text
+    assert "| `sparse_probing` | 0/7 |" in report_text
     assert (root / "plots" / "core.png").is_file()
     assert not (root / "plots" / "overview.png").exists()
 
@@ -257,5 +293,5 @@ def test_saebench_report_without_results_explains_how_to_resume(
     report_text = report.read_text(encoding="utf-8")
     assert "**Partial report:**" in report_text
     assert "sae-comp saebench --config" in report_text
-    assert "| `core` | 0/6 |" in report_text
+    assert "| `core` | 0/7 |" in report_text
     assert not (tmp_path / "saebench_results" / "plots").exists()

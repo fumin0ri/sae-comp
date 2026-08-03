@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sae-comp"
 version = "0.1.0"
-description = "Controlled comparison of standard, temporal, and transition-JEPA sparse autoencoders"
+description = "Controlled comparison of standard, temporal, and Rectified LpJEPA sparse autoencoders"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

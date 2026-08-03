@@ -18,6 +18,7 @@ COLORS = {
     "proposal_w004": "#E45756",
     "proposal_w008": "#72B7B2",
     "proposal_w016": "#B279A2",
+    "proposal_w032": "#FF9DA6",
 }
 
 
@@ -27,7 +28,7 @@ def display_name(label: str) -> str:
     if label == "temporal":
         return "Temporal SAE"
     if label.startswith("proposal_w"):
-        return f"Random-pair proposal W={int(label.removeprefix('proposal_w'))}"
+        return f"Rectified LpJEPA W={int(label.removeprefix('proposal_w'))}"
     return label
 
 
@@ -147,45 +148,45 @@ def _plot_probes(
     return destination
 
 
-def _plot_forecasts(metrics: dict[str, Any], output_dir: Path) -> Path:
-    destination = output_dir / "forecast_diagnostics.png"
-    forecasts = metrics["proposal_forecasts"]
+def _plot_views(metrics: dict[str, Any], output_dir: Path) -> Path:
+    destination = output_dir / "shared_view_diagnostics.png"
+    views = metrics["proposal_views"]
     figure, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
     figure.suptitle(
-        "Random-pair endpoint forecast diagnostics by horizon",
+        "Rectified LpJEPA shared-view diagnostics by token distance",
         fontsize=16,
         fontweight="bold",
     )
-    for label, values in forecasts.items():
-        offsets = [item["offset"] for item in values["offsets"]]
+    for label, values in views.items():
+        distances = [item["distance"] for item in values["distances"]]
         axes[0].plot(
-            offsets,
-            [item["code_cosine"] for item in values["offsets"]],
+            distances,
+            [item["high_cosine"] for item in values["distances"]],
             color=COLORS.get(label, "#777777"),
             label=display_name(label),
         )
         axes[1].plot(
-            offsets,
-            [item["true_minus_shuffled"] for item in values["offsets"]],
+            distances,
+            [item["high_margin"] for item in values["distances"]],
             color=COLORS.get(label, "#777777"),
             label=display_name(label),
         )
-    common_horizon = min(
-        values["common_horizon_max_offset"] for values in forecasts.values()
+    common_distance = min(
+        values["common_max_distance"] for values in views.values()
     )
     for axis in axes:
         axis.axvline(
-            common_horizon,
+            common_distance,
             color="#333333",
             linestyle="--",
             linewidth=1,
-            label="Common comparison horizon",
+            label="Common comparison distance",
         )
-        axis.set_xlabel("Forecast horizon")
+        axis.set_xlabel("Absolute token distance")
         axis.grid(alpha=0.25)
-    axes[0].set_title("Target-code cosine")
+    axes[0].set_title("Same-span high-code cosine")
     axes[0].set_ylabel("Cosine similarity")
-    axes[1].set_title("True-context minus shuffled-context cosine")
+    axes[1].set_title("Same-span minus shuffled-sequence cosine")
     axes[1].set_ylabel("Cosine difference")
     axes[1].legend(loc="best", fontsize=8)
     _save_figure(figure, destination)
@@ -212,7 +213,7 @@ def _plot_training(cfg: ExperimentConfig, output_dir: Path) -> Path:
     }
     series.update(
         {
-            label: (history, "online_reconstruction_fvu")
+            label: (history, "full_reconstruction_fvu")
             for label, history in proposals.items()
         }
     )
@@ -250,7 +251,7 @@ def build_controlled_plots(cfg: ExperimentConfig) -> list[Path]:
         _plot_common_metrics(metrics, output_dir),
         _plot_smoothness(metrics, output_dir),
         _plot_probes(probes, cfg, output_dir),
-        _plot_forecasts(metrics, output_dir),
+        _plot_views(metrics, output_dir),
         _plot_training(cfg, output_dir),
     ]
     (output_dir / "manifest.json").write_text(

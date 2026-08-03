@@ -12,8 +12,7 @@ from tqdm import tqdm
 
 from .config import ExperimentConfig
 
-
-FORMAT = "sae-comp-long-residual-sequences-v2"
+FORMAT = "sae-comp-exchangeable-view-sequences-v3"
 
 
 def activation_config_fingerprint(cfg: ExperimentConfig) -> str:
@@ -239,7 +238,7 @@ def extract_activations(cfg: ExperimentConfig, overwrite: bool = False) -> Path:
     mean_square = square_sum / normalization_tokens
     d_in = int(mean.numel())
     scalar_rms = torch.sqrt(
-        ((mean_square - mean.square().sum()).clamp_min(1e-12) / d_in)
+        (mean_square - mean.square().sum()).clamp_min(1e-12) / d_in
     )
     resolved_revision = getattr(model.config, "_commit_hash", None)
     manifest = {
@@ -268,8 +267,12 @@ def extract_activations(cfg: ExperimentConfig, overwrite: bool = False) -> Path:
         "minimum_valid_length": cfg.data.min_valid_tokens,
         "pair_sampling": {
             "span_length": "uniform integer in [min_span_length, max_span_length]",
-            "context": "uniform over non-endpoint positions in sampled span",
-            "endpoint_support": "shared across all horizons and sweep conditions",
+            "views": (
+                "two distinct ordered positions sampled uniformly without "
+                "replacement from the span"
+            ),
+            "view_marginals": "exchangeable; neither view is a prediction target",
+            "span_end_support": "shared across span lengths and sweep conditions",
             "performed_online_during_training": True,
         },
         "d_in": d_in,
@@ -404,7 +407,7 @@ class ActivationStore:
                     )
             epoch += 1
 
-    def random_pair_batches(
+    def random_view_pair_batches(
         self,
         batch_size: int,
         max_span_length: int,
@@ -412,7 +415,7 @@ class ActivationStore:
         boundary_max_horizon: int | None = None,
         split: str = "train",
     ) -> Iterator[dict[str, torch.Tensor]]:
-        """Yield deterministic random span/context/endpoint training pairs."""
+        """Yield deterministic exchangeable view pairs from random spans."""
         stored_max_span = int(self.manifest["max_span_length"])
         if not 2 <= min_span_length <= max_span_length <= stored_max_span:
             raise ValueError(
@@ -451,16 +454,11 @@ class ActivationStore:
                     (len(rows),),
                     generator=generator,
                 )
-                horizons = 1 + torch.floor(
-                    torch.rand(len(rows), generator=generator)
-                    * (span_lengths - 1)
-                ).long()
-                sampled = _sample_random_pairs(
+                sampled = _sample_random_view_pairs(
                     sequences,
                     lengths,
                     rows,
                     span_lengths,
-                    horizons,
                     burn_in,
                     boundary_horizon,
                     generator,
@@ -517,20 +515,17 @@ class ActivationStore:
             yield load_shard(self.root, record)
 
 
-def _sample_random_pairs(
+def _sample_random_view_pairs(
     sequences: torch.Tensor,
     valid_lengths: torch.Tensor,
     rows: torch.Tensor,
     span_lengths: torch.Tensor,
-    horizons: torch.Tensor,
     burn_in_tokens: int,
     boundary_max_horizon: int,
     generator: torch.Generator,
 ) -> dict[str, torch.Tensor]:
-    if torch.any(horizons < 1) or torch.any(horizons >= span_lengths):
-        raise ValueError("each horizon must lie in [1, span_length-1]")
     minimum_endpoints = torch.full_like(
-        horizons, burn_in_tokens + boundary_max_horizon
+        span_lengths, burn_in_tokens + boundary_max_horizon
     )
     if torch.any(minimum_endpoints >= valid_lengths):
         raise ValueError("sequence is too short for burn-in and sampled horizon")
@@ -538,13 +533,23 @@ def _sample_random_pairs(
     endpoints = minimum_endpoints + torch.floor(
         torch.rand(len(rows), generator=generator) * endpoint_support
     ).long()
-    contexts = endpoints - horizons
+    span_starts = endpoints - span_lengths + 1
+    offsets_a = torch.floor(
+        torch.rand(len(rows), generator=generator) * span_lengths
+    ).long()
+    offsets_b = torch.floor(
+        torch.rand(len(rows), generator=generator) * (span_lengths - 1)
+    ).long()
+    offsets_b = offsets_b + (offsets_b >= offsets_a).long()
+    positions_a = span_starts + offsets_a
+    positions_b = span_starts + offsets_b
     return {
-        "context": sequences[rows, contexts],
-        "target": sequences[rows, endpoints],
+        "view_a": sequences[rows, positions_a],
+        "view_b": sequences[rows, positions_b],
         "span_length": span_lengths,
-        "horizon": horizons,
-        "span_start_index": endpoints - span_lengths + 1,
-        "context_index": contexts,
-        "endpoint_index": endpoints,
+        "distance": (positions_a - positions_b).abs(),
+        "span_start_index": span_starts,
+        "span_end_index": endpoints,
+        "position_a": positions_a,
+        "position_b": positions_b,
     }

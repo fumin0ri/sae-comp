@@ -1,12 +1,16 @@
+import pytest
 import torch
 
 from sae_comp.models import (
+    RectifiedLpJEPAConfig,
+    RectifiedLpJEPASAE,
     SparseAutoencoder,
     SparseAutoencoderConfig,
-    TransitionJEPA,
-    TransitionJEPAConfig,
     batch_topk,
+    rgg_mean_for_active_fraction,
+    sample_rectified_generalized_gaussian,
     token_topk,
+    unit_variance_generalized_gaussian_sigma,
 )
 
 
@@ -37,126 +41,63 @@ def test_sparse_autoencoder_shapes_and_unit_decoder() -> None:
     )
 
 
-def test_transition_jepa_shapes() -> None:
-    sae_cfg = SparseAutoencoderConfig(d_in=8, d_sae=24, k=3)
-    sae = SparseAutoencoder(sae_cfg)
-    cfg = TransitionJEPAConfig(
-        d_in=8,
-        d_sae=24,
-        k=3,
-        window_size=5,
-        predictor_width=10,
-    )
-    model = TransitionJEPA(cfg, sae)
-    output = model(
-        torch.randn(4, 8),
-        torch.randn(4, 8),
-        torch.tensor([1, 2, 3, 4]),
-    )
-    assert cfg.d_high == 5
-    assert cfg.d_low == 19
-    assert cfg.k_high == 1
-    assert cfg.k_low == 2
-    assert cfg.d_high + cfg.d_low == cfg.d_sae
-    assert cfg.k_high + cfg.k_low == cfg.k
-    assert output["predicted_codes"].shape == (4, 5)
-    assert output["target_codes"].shape == (4, 5)
-    assert output["low_context_codes"].shape == (4, 19)
-    assert output["online_target_reconstruction"].shape == (4, 8)
-    assert output["target_reconstruction"].shape == (4, 8)
-    torch.testing.assert_close(output["target_codes"], output["target_code"])
-    assert not output["target_codes"].requires_grad
-
-
-def test_transition_jepa_uses_explicit_per_sample_horizon() -> None:
-    sae_cfg = SparseAutoencoderConfig(d_in=8, d_sae=24, k=3)
-    model = TransitionJEPA(
-        TransitionJEPAConfig(
+def make_proposal() -> RectifiedLpJEPASAE:
+    model = RectifiedLpJEPASAE(
+        RectifiedLpJEPAConfig(
             d_in=8,
-            d_sae=24,
-            k=3,
-            window_size=8,
-            predictor_width=10,
-        ),
-        SparseAutoencoder(sae_cfg),
+            d_sae=20,
+            low_k=4,
+            max_span_length=6,
+            high_fraction=0.2,
+            target_active_fraction=0.1,
+        )
     )
-    context = torch.randn(4, 8)
-    target = torch.randn(4, 8)
-    output = model(context, target, torch.tensor([1, 3, 5, 7]))
-    assert output["context_codes"].shape == (4, 5)
-    assert output["predicted_codes"].shape == (4, 5)
-    assert output["target_codes"].shape == (4, 5)
-    assert output["target_residual"].shape == (4, 8)
-    assert bool(
-        ((output["high_codes"] > 0).sum(dim=-1) <= model.cfg.k_high).all()
-    )
-    assert bool(
-        ((output["low_codes"] > 0).sum(dim=-1) <= model.cfg.k_low).all()
-    )
+    model.initialize_normalization(torch.zeros(8), 1.0)
+    return model
 
 
-def test_high_and_low_reconstruction_are_cumulative() -> None:
-    model = TransitionJEPA(
-        TransitionJEPAConfig(d_in=8, d_sae=20, k=5, window_size=6),
-        SparseAutoencoder(
-            SparseAutoencoderConfig(d_in=8, d_sae=20, k=5)
-        ),
+@pytest.mark.parametrize("p", [1.0, 2.0])
+def test_rgg_parameterization_controls_active_fraction(p: float) -> None:
+    sigma = unit_variance_generalized_gaussian_sigma(p)
+    mu = rgg_mean_for_active_fraction(p, 0.1, sigma)
+    torch.manual_seed(1)
+    samples = sample_rectified_generalized_gaussian(
+        (200_000,), p=p, mu=mu, sigma=sigma, device=torch.device("cpu")
     )
-    output = model(
-        torch.randn(3, 8), torch.randn(3, 8), torch.tensor([1, 2, 5])
-    )
-    expected = output["online_high_reconstruction"] + model.decode_low(
-        output["online_target_low_code"], ema=False, add_bias=False
-    )
-    torch.testing.assert_close(output["online_target_reconstruction"], expected)
-    assert output["predicted_codes"].shape[-1] == model.cfg.d_high
+    assert abs(float((samples > 0).float().mean()) - 0.1) < 0.005
 
 
-def test_forecast_decoder_cannot_use_low_dictionary_rows() -> None:
-    model = TransitionJEPA(
-        TransitionJEPAConfig(d_in=8, d_sae=20, k=5, window_size=6),
-        SparseAutoencoder(
-            SparseAutoencoderConfig(d_in=8, d_sae=20, k=5)
-        ),
-    )
-    code = torch.randn(2, 3, model.cfg.d_high)
-    before = model.decode_high(code, ema=True, add_bias=False)
+def test_proposal_high_is_shifted_relu_and_only_low_is_topk() -> None:
+    model = make_proposal()
+    assert model.cfg.d_high == 4
+    assert model.cfg.d_low == 16
     with torch.no_grad():
-        model.ema_decoder[model.cfg.d_high :].add_(1000)
-    after = model.decode_high(code, ema=True, add_bias=False)
-    torch.testing.assert_close(before, after)
+        model.encoder.weight.zero_()
+        model.encoder.bias.fill_(1.0)
+    high, low = model.split_code(model.encode(torch.randn(3, 8)))
+    assert torch.all(high > 0)
+    assert torch.all((low > 0).sum(dim=-1) == model.cfg.low_k)
 
 
-def test_ema_update_tracks_full_sae_and_normalizes_decoder() -> None:
-    sae = SparseAutoencoder(SparseAutoencoderConfig(d_in=8, d_sae=24, k=3))
-    model = TransitionJEPA(
-        TransitionJEPAConfig(d_in=8, d_sae=24, k=3, window_size=5),
-        sae,
+def test_proposal_has_two_exchangeable_views_and_no_predictor() -> None:
+    model = make_proposal()
+    outputs = model(torch.randn(2, 8), torch.randn(2, 8))
+    assert "predicted_codes" not in outputs
+    assert not hasattr(model, "predictor")
+    assert not hasattr(model, "ema_encoder")
+    assert outputs["high_a"].shape == (2, model.cfg.d_high)
+    expected = outputs["high_reconstruction_a"] + model.decode_low(
+        outputs["low_a"]
     )
-    before_bias = model.ema_pre_bias.clone()
-    before_decoder = model.ema_decoder.clone()
-    with torch.no_grad():
-        model.sae.pre_bias.add_(2)
-        model.sae.decoder.add_(0.5)
-    model.update_ema_sae(decay=0.5)
-    torch.testing.assert_close(model.ema_pre_bias, before_bias + 1)
-    assert not torch.allclose(model.ema_decoder, before_decoder)
+    torch.testing.assert_close(outputs["full_reconstruction_a"], expected)
+
+
+def test_proposal_initialization_covers_single_full_sae() -> None:
+    model = make_proposal()
     torch.testing.assert_close(
-        model.ema_decoder.norm(dim=1),
-        torch.ones(model.cfg.d_sae),
-        atol=1e-6,
-        rtol=0,
+        model.encoder.bias[: model.cfg.d_high],
+        torch.full((model.cfg.d_high,), model.cfg.target_mu),
     )
-
-
-def test_final_sae_is_the_full_ema_teacher() -> None:
-    sae = SparseAutoencoder(SparseAutoencoderConfig(d_in=8, d_sae=24, k=3))
-    model = TransitionJEPA(
-        TransitionJEPAConfig(d_in=8, d_sae=24, k=3, window_size=5),
-        sae,
+    torch.testing.assert_close(
+        model.decoder.norm(dim=1), torch.ones(model.cfg.d_sae), atol=1e-5, rtol=0
     )
-    x = torch.randn(6, 8)
-    final = model.final_ema_sae()
-    expected = model.encode_ema(x)
-    torch.testing.assert_close(final.encode_token_topk(x), expected)
-    torch.testing.assert_close(final.decode(expected), model.decode_ema(expected))

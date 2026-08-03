@@ -43,7 +43,7 @@ def test_minimum_sequence_length_filters_training_pool(tmp_path: Path) -> None:
     assert bool((previous == 1).all())
 
 
-def test_random_pair_batches_are_boundary_safe_and_use_requested_horizons(
+def test_random_view_pairs_are_boundary_safe_and_exchangeable(
     tmp_path: Path,
 ) -> None:
     shard = tmp_path / "train.pt"
@@ -70,17 +70,22 @@ def test_random_pair_batches_are_boundary_safe_and_use_requested_horizons(
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     batch = next(
-        ActivationStore(manifest_path, seed=3).random_pair_batches(
+        ActivationStore(manifest_path, seed=3).random_view_pair_batches(
             4,
             max_span_length=4,
             boundary_max_horizon=7,
         )
     )
-    assert bool((batch["horizon"] >= 1).all())
-    assert bool((batch["horizon"] < batch["span_length"]).all())
+    assert bool((batch["distance"] >= 1).all())
+    assert bool((batch["distance"] < batch["span_length"]).all())
     assert bool((batch["span_length"] <= 4).all())
-    assert bool((batch["context_index"] >= 2).all())
-    assert bool((batch["endpoint_index"] >= 9).all())
+    assert bool((batch["position_a"] >= batch["span_start_index"]).all())
+    assert bool((batch["position_b"] >= batch["span_start_index"]).all())
+    assert bool((batch["position_a"] <= batch["span_end_index"]).all())
+    assert bool((batch["position_b"] <= batch["span_end_index"]).all())
+    assert bool((batch["position_a"] >= 2).all())
+    assert bool((batch["position_b"] >= 2).all())
+    assert bool((batch["span_end_index"] >= 9).all())
     torch.testing.assert_close(
-        batch["endpoint_index"] - batch["context_index"], batch["horizon"]
+        (batch["position_a"] - batch["position_b"]).abs(), batch["distance"]
     )

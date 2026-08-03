@@ -10,7 +10,8 @@ STANDARD_STEPS="${STANDARD_STEPS:-}"
 BRANCH_STEPS="${BRANCH_STEPS:-}"
 WARMUP_STEPS="${WARMUP_STEPS:-}"
 SAE_WARMUP_STEPS="${SAE_WARMUP_STEPS:-}"
-PREDICTION_RAMP_STEPS="${PREDICTION_RAMP_STEPS:-}"
+REGULARIZATION_RAMP_STEPS="${REGULARIZATION_RAMP_STEPS:-}"
+AXIS_RDM_FEATURES="${AXIS_RDM_FEATURES:-512}"
 
 python -m sae_comp.cuda_check
 
@@ -19,6 +20,7 @@ args=(
   --config configs/controlled_rtx4090.toml
   --stages extract,train-controls,train-window-sweep,saebench,report-saebench
   --training-scale "$TRAINING_SCALE"
+  --axis-rdm-features "$AXIS_RDM_FEATURES"
 )
 
 [[ -n "$RUN_DIR_OVERRIDE" ]] && args+=(--run-dir "$RUN_DIR_OVERRIDE")
@@ -28,8 +30,8 @@ args=(
 [[ -n "$SAE_WARMUP_STEPS" ]] && args+=(
   --sae-warmup-steps "$SAE_WARMUP_STEPS"
 )
-[[ -n "$PREDICTION_RAMP_STEPS" ]] && args+=(
-  --prediction-ramp-steps "$PREDICTION_RAMP_STEPS"
+[[ -n "$REGULARIZATION_RAMP_STEPS" ]] && args+=(
+  --regularization-ramp-steps "$REGULARIZATION_RAMP_STEPS"
 )
 
 "${args[@]}"

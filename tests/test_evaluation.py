@@ -9,10 +9,8 @@ from sae_comp.evaluation import (
     wavelet_smoothness,
 )
 from sae_comp.models import (
-    SparseAutoencoder,
-    SparseAutoencoderConfig,
-    TransitionJEPA,
-    TransitionJEPAConfig,
+    RectifiedLpJEPAConfig,
+    RectifiedLpJEPASAE,
 )
 from sae_comp.training import _save_checkpoint
 
@@ -37,17 +35,16 @@ def test_metrics_handle_all_zero_features() -> None:
     assert multiscale_smoothness(features) == 0
 
 
-def test_proposal_checkpoint_exports_full_ema_sae(tmp_path) -> None:
+def test_proposal_checkpoint_loads_the_single_rectified_sae(tmp_path) -> None:
     cfg = ExperimentConfig()
-    sae = SparseAutoencoder(SparseAutoencoderConfig(d_in=6, d_sae=12, k=2))
-    proposal_cfg = TransitionJEPAConfig(
-        d_in=6, d_sae=12, k=2, window_size=4
+    proposal_cfg = RectifiedLpJEPAConfig(
+        d_in=6, d_sae=12, low_k=2, max_span_length=4
     )
-    proposal = TransitionJEPA(proposal_cfg, sae)
+    proposal = RectifiedLpJEPASAE(proposal_cfg)
     with torch.no_grad():
-        proposal.sae.pre_bias.add_(3)
-        proposal.sae.encoder.weight.add_(2)
-        proposal.sae.decoder.add_(1)
+        proposal.pre_bias.add_(3)
+        proposal.encoder.weight.add_(2)
+        proposal.decoder.add_(1)
     path = tmp_path / "proposal.pt"
     _save_checkpoint(
         path,
@@ -57,23 +54,22 @@ def test_proposal_checkpoint_exports_full_ema_sae(tmp_path) -> None:
         cfg,
         {"config_fingerprint": "activation-test"},
     )
-    final_sae, loaded_proposal, method = load_method(path, torch.device("cpu"))
+    loaded_sae, loaded_proposal, method = load_method(path, torch.device("cpu"))
     assert method == "proposal"
     assert loaded_proposal is not None
-    torch.testing.assert_close(final_sae.pre_bias, proposal.ema_pre_bias)
-    torch.testing.assert_close(final_sae.encoder.weight, proposal.ema_encoder.weight)
-    torch.testing.assert_close(final_sae.decoder, proposal.ema_decoder)
-    assert not torch.allclose(final_sae.pre_bias, proposal.sae.pre_bias)
-    assert final_sae.cfg.group_topk
+    assert loaded_sae is loaded_proposal
+    torch.testing.assert_close(loaded_sae.pre_bias, proposal.pre_bias)
+    torch.testing.assert_close(loaded_sae.encoder.weight, proposal.encoder.weight)
+    torch.testing.assert_close(loaded_sae.decoder, proposal.decoder)
+    assert loaded_sae.cfg.low_k == 2
 
 
 def test_obsolete_proposal_checkpoint_is_rejected(tmp_path) -> None:
     cfg = ExperimentConfig()
-    sae = SparseAutoencoder(SparseAutoencoderConfig(d_in=6, d_sae=12, k=2))
-    proposal_cfg = TransitionJEPAConfig(
-        d_in=6, d_sae=12, k=2, window_size=4
+    proposal_cfg = RectifiedLpJEPAConfig(
+        d_in=6, d_sae=12, low_k=2, max_span_length=4
     )
-    proposal = TransitionJEPA(proposal_cfg, sae)
+    proposal = RectifiedLpJEPASAE(proposal_cfg)
     path = tmp_path / "old-proposal.pt"
     _save_checkpoint(
         path,

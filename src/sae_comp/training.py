@@ -16,41 +16,110 @@ from .activations import ActivationStore, load_manifest
 from .config import ExperimentConfig
 from .models import (
     PROPOSAL_ARCHITECTURE_ID,
+    RectifiedLpJEPAConfig,
+    RectifiedLpJEPASAE,
     SparseAutoencoder,
     SparseAutoencoderConfig,
-    TransitionJEPA,
-    TransitionJEPAConfig,
+    sample_rectified_generalized_gaussian,
 )
 
-PROPOSAL_SOURCE_COMMIT = "39ca51a320afbab48486f38594768d37fc68c0dc"
+PROPOSAL_SOURCE_COMMIT = "66d8a6f87929a9a415929043863acaa0f14d4207"
 
 
-def horizon_sampling_probabilities(
-    min_span_length: int, max_span_length: int
-) -> torch.Tensor:
-    """Exact P(h) for uniform span length then uniform non-endpoint context."""
-    if not 2 <= min_span_length <= max_span_length:
-        raise ValueError("span bounds must satisfy 2 <= min <= max")
-    probabilities = torch.zeros(max_span_length, dtype=torch.float64)
-    span_count = max_span_length - min_span_length + 1
-    for span_length in range(min_span_length, max_span_length + 1):
-        probabilities[1:span_length] += 1 / (span_count * (span_length - 1))
-    return probabilities
+def axis_aligned_distribution_matching_loss(
+    views: tuple[torch.Tensor, ...],
+    target: torch.Tensor,
+    features: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match sampled high-code coordinate marginals with axis-aligned 1D OT."""
+    if not views or any(view.ndim != 2 for view in views):
+        raise ValueError("views must be non-empty matrices")
+    if target.ndim != 2 or any(view.shape != target.shape for view in views):
+        raise ValueError("axis RDM views and target must have the same shape")
+    if features < 0:
+        raise ValueError("axis RDM feature count must be non-negative")
+    zero = views[0].float().sum() * 0.0
+    if features == 0:
+        return zero, torch.zeros((), device=target.device, dtype=torch.long)
+    count = min(features, target.shape[-1])
+    indices = torch.randperm(target.shape[-1], device=target.device)[:count]
+    target_axes = torch.sort(target.index_select(-1, indices), dim=0).values
+    raw = sum(
+        (
+            torch.sort(view.float().index_select(-1, indices), dim=0).values
+            - target_axes
+        )
+        .square()
+        .mean()
+        for view in views
+    ) / len(views)
+    target_energy = target_axes.square().mean().clamp_min(1e-8)
+    return raw / target_energy, torch.as_tensor(count, device=target.device)
 
 
-def horizon_loss_weight_table(
-    min_span_length: int, max_span_length: int, mode: str
-) -> torch.Tensor:
-    probabilities = horizon_sampling_probabilities(
-        min_span_length, max_span_length
+def rectified_distribution_matching_loss(
+    views: tuple[torch.Tensor, ...],
+    model_cfg: RectifiedLpJEPAConfig,
+    projections: int,
+    projection_chunk_size: int,
+    axis_features: int = 0,
+    axis_weight: float = 1.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Random-projection and axis-aligned 2-Wasserstein RGG matching."""
+    if not views or any(view.ndim != 2 for view in views):
+        raise ValueError("views must be non-empty [batch, d_high] matrices")
+    if any(view.shape != views[0].shape for view in views):
+        raise ValueError("all RDM views must have the same shape")
+    if views[0].shape[-1] != model_cfg.d_high:
+        raise ValueError("RDM views must contain only the high code")
+    if projections < 1 or projection_chunk_size < 1:
+        raise ValueError("projection counts must be positive")
+    if axis_features < 0 or axis_weight < 0:
+        raise ValueError("axis RDM feature count and weight must be non-negative")
+    batch, dimension = views[0].shape
+    target = sample_rectified_generalized_gaussian(
+        (batch, dimension),
+        p=model_cfg.rgg_p,
+        mu=model_cfg.target_mu,
+        sigma=model_cfg.resolved_target_sigma,
+        device=views[0].device,
     )
-    weights = torch.ones(max_span_length, dtype=torch.float64)
-    if mode == "inverse_probability":
-        weights[1:] = 1 / ((max_span_length - 1) * probabilities[1:])
-    elif mode != "none":
-        raise ValueError(f"unsupported horizon weighting mode: {mode}")
-    weights[0] = 0
-    return weights.float()
+    total = views[0].float().sum() * 0.0
+    raw_total = total
+    completed = 0
+    while completed < projections:
+        width = min(projection_chunk_size, projections - completed)
+        directions = F.normalize(
+            torch.randn(dimension, width, device=views[0].device), dim=0
+        )
+        target_projection = torch.sort(target @ directions, dim=0).values
+        target_energy = target_projection.square().mean().clamp_min(1e-8)
+        chunk_raw = sum(
+            (
+                torch.sort(view.float() @ directions, dim=0).values
+                - target_projection
+            )
+            .square()
+            .mean()
+            for view in views
+        ) / len(views)
+        total = total + width * chunk_raw / target_energy
+        raw_total = raw_total + width * chunk_raw
+        completed += width
+    random_projection = total / projections
+    axis_aligned, sampled_axes = axis_aligned_distribution_matching_loss(
+        views, target, axis_features
+    )
+    combined = random_projection + axis_weight * axis_aligned
+    return combined, {
+        "random_projection": random_projection,
+        "random_projection_raw": raw_total / projections,
+        "axis_aligned": axis_aligned,
+        "axis_sampled_features": sampled_axes,
+        "target_active_fraction": (target > 0).float().mean(),
+        "target_l0": (target > 0).sum(dim=-1).float().mean(),
+        "target_second_moment": target.square().mean(),
+    }
 
 
 def _autocast(device: torch.device, dtype: str):
@@ -356,131 +425,175 @@ def _train_temporal(
 
 
 def _proposal_loss(
-    model: TransitionJEPA,
-    context: torch.Tensor,
-    target: torch.Tensor,
-    horizon: torch.Tensor,
-    prediction_weight: float,
+    model: RectifiedLpJEPASAE,
+    view_a: torch.Tensor,
+    view_b: torch.Tensor,
+    invariance_weight: float,
+    rdm_weight: float,
     cfg: ExperimentConfig,
     *,
-    span_length: torch.Tensor | None = None,
-    horizon_weight_table: torch.Tensor | None = None,
+    distance: torch.Tensor | None = None,
+    collect_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    output = model(context, target, horizon)
+    output = model(view_a, view_b)
     residual_scale = (
-        target - model.sae.pre_bias.detach()
-    ).float().square().mean().clamp_min(1e-8)
-    high_reconstruction = (
-        output["online_high_reconstruction"] - target
-    ).float().square().mean() / residual_scale
-    full_reconstruction = (
-        output["online_target_reconstruction"] - target
-    ).float().square().mean() / residual_scale
+        torch.cat(
+            (view_a - model.pre_bias, view_b - model.pre_bias), dim=0
+        )
+        .float()
+        .square()
+        .mean()
+        .clamp_min(1e-8)
+    )
+    high_reconstruction = 0.5 * (
+        (output["high_reconstruction_a"] - view_a).float().square().mean()
+        + (output["high_reconstruction_b"] - view_b).float().square().mean()
+    ) / residual_scale
+    full_reconstruction = 0.5 * (
+        (output["full_reconstruction_a"] - view_a).float().square().mean()
+        + (output["full_reconstruction_b"] - view_b).float().square().mean()
+    ) / residual_scale
     reconstruction = (
         model.cfg.high_reconstruction_weight * high_reconstruction
         + (1 - model.cfg.high_reconstruction_weight) * full_reconstruction
     )
-    ema_residual_scale = (
-        target - model.ema_pre_bias.detach()
-    ).float().square().mean().clamp_min(1e-8)
-    ema_high_reconstruction = (
-        output["target_high_reconstruction"] - target
-    ).float().square().mean() / ema_residual_scale
-    ema_reconstruction = (
-        output["target_reconstruction"] - target
-    ).float().square().mean() / ema_residual_scale
-    prediction = output["predicted_codes"]
-    targets = output["target_codes"].detach()
-    cosine = F.cosine_similarity(prediction, targets, dim=-1)
-    target_energy = targets.float().square().mean(dim=-1).clamp_min(1e-8)
-    normalized_mse = (prediction - targets).float().square().mean(
-        dim=-1
-    ) / target_energy
-    per_sample_prediction_loss = 1 - cosine + 0.25 * normalized_mse
-    if horizon_weight_table is None:
-        sample_weights = torch.ones_like(per_sample_prediction_loss)
+    invariance_raw = (
+        output["high_a"].float() - output["high_b"].float()
+    ).square().mean()
+    if rdm_weight > 0 or collect_metrics:
+        rdm, rdm_metrics = rectified_distribution_matching_loss(
+            (output["high_a"], output["high_b"]),
+            model.cfg,
+            cfg.proposal.rdm_projections,
+            cfg.proposal.rdm_projection_chunk_size,
+            cfg.proposal.axis_rdm_features,
+            cfg.proposal.axis_rdm_weight,
+        )
     else:
-        sample_weights = horizon_weight_table.to(
-            device=horizon.device,
-            dtype=per_sample_prediction_loss.dtype,
-        ).index_select(0, horizon)
-    prediction_loss_unweighted = per_sample_prediction_loss.mean()
-    prediction_loss = (sample_weights * per_sample_prediction_loss).mean()
-    residual_prediction = (
-        output["predictable_residual"] - output["target_residual"]
-    ).float().square().mean() / ema_residual_scale
-    loss = reconstruction + prediction_weight * prediction_loss
-    predicted_active = output["sparse_predicted_codes"] > 0
-    target_active = targets > 0
-    intersection = (predicted_active & target_active).sum(dim=-1).float()
-    precision = intersection / predicted_active.sum(dim=-1).float().clamp_min(1)
-    recall = intersection / target_active.sum(dim=-1).float().clamp_min(1)
-    union = (predicted_active | target_active).sum(dim=-1).float().clamp_min(1)
-    metrics = {
+        target = sample_rectified_generalized_gaussian(
+            output["high_a"].shape,
+            p=model.cfg.rgg_p,
+            mu=model.cfg.target_mu,
+            sigma=model.cfg.resolved_target_sigma,
+            device=output["high_a"].device,
+        )
+        rdm = output["high_a"].float().sum() * 0.0
+        rdm_metrics = {
+            "random_projection": rdm,
+            "random_projection_raw": rdm,
+            "axis_aligned": rdm,
+            "axis_sampled_features": torch.zeros(
+                (), device=rdm.device, dtype=torch.long
+            ),
+            "target_active_fraction": (target > 0).float().mean(),
+            "target_l0": (target > 0).sum(dim=-1).float().mean(),
+            "target_second_moment": target.square().mean(),
+        }
+    invariance = invariance_raw / rdm_metrics["target_second_moment"].clamp_min(
+        1e-8
+    )
+    loss = reconstruction + invariance_weight * invariance + rdm_weight * rdm
+    if not collect_metrics:
+        return loss, {}
+
+    with torch.no_grad():
+        permutation = torch.roll(
+            torch.arange(len(view_a), device=view_a.device), shifts=1
+        )
+        high_positive = F.cosine_similarity(
+            output["high_a"].float(), output["high_b"].float(), dim=-1
+        )
+        high_shuffled = F.cosine_similarity(
+            output["high_a"].float(),
+            output["high_b"].index_select(0, permutation).float(),
+            dim=-1,
+        )
+        low_positive = F.cosine_similarity(
+            output["low_a"].float(), output["low_b"].float(), dim=-1
+        )
+        swap_a = model.decode_high(output["high_b"]) + model.decode_low(
+            output["low_a"]
+        )
+        swap_b = model.decode_high(output["high_a"]) + model.decode_low(
+            output["low_b"]
+        )
+        swap_fvu = 0.5 * (
+            (swap_a - view_a).float().square().mean()
+            + (swap_b - view_b).float().square().mean()
+        ) / residual_scale
+    return loss, {
         "loss": float(loss.detach()),
-        "online_reconstruction_fvu": float(full_reconstruction.detach()),
-        "online_high_reconstruction_fvu": float(high_reconstruction.detach()),
-        "weighted_reconstruction_fvu": float(reconstruction.detach()),
-        "ema_reconstruction_fvu": float(ema_reconstruction.detach()),
-        "ema_high_reconstruction_fvu": float(ema_high_reconstruction.detach()),
-        "prediction_loss": float(prediction_loss.detach()),
-        "prediction_loss_unweighted": float(prediction_loss_unweighted.detach()),
-        "mean_horizon_loss_weight": float(sample_weights.mean().detach()),
-        "code_cosine": float(cosine.mean().detach()),
-        "code_nrmse": float(normalized_mse.mean().detach()),
-        "support_precision": float(precision.mean().detach()),
-        "support_recall": float(recall.mean().detach()),
-        "support_jaccard": float((intersection / union).mean().detach()),
-        "residual_prediction_fvu": float(residual_prediction.detach()),
-        "sae_l0": float(
-            (output["codes"] > 0).sum(dim=-1).float().mean().detach()
+        "reconstruction_loss": float(reconstruction.detach()),
+        "full_reconstruction_fvu": float(full_reconstruction.detach()),
+        "high_reconstruction_fvu": float(high_reconstruction.detach()),
+        "invariance_loss": float(invariance.detach()),
+        "invariance_raw_mse": float(invariance_raw.detach()),
+        "rdm_loss": float(rdm.detach()),
+        "random_projection_rdm_loss": float(
+            rdm_metrics["random_projection"].detach()
         ),
+        "random_projection_rdm_raw": float(
+            rdm_metrics["random_projection_raw"].detach()
+        ),
+        "axis_aligned_rdm_loss": float(rdm_metrics["axis_aligned"].detach()),
+        "axis_sampled_features": float(rdm_metrics["axis_sampled_features"]),
+        "high_positive_cosine": float(high_positive.mean()),
+        "high_shuffled_cosine": float(high_shuffled.mean()),
+        "high_positive_margin": float((high_positive - high_shuffled).mean()),
+        "low_positive_cosine": float(low_positive.mean()),
+        "swap_reconstruction_fvu": float(swap_fvu),
         "high_l0": float(
-            (output["high_codes"] > 0).sum(dim=-1).float().mean().detach()
+            0.5
+            * (
+                (output["high_a"] > 0).sum(dim=-1).float().mean()
+                + (output["high_b"] > 0).sum(dim=-1).float().mean()
+            )
         ),
         "low_l0": float(
-            (output["low_codes"] > 0).sum(dim=-1).float().mean().detach()
+            0.5
+            * (
+                (output["low_a"] > 0).sum(dim=-1).float().mean()
+                + (output["low_b"] > 0).sum(dim=-1).float().mean()
+            )
         ),
-        "mean_horizon": float(horizon.float().mean()),
+        "high_active_fraction": float(
+            0.5
+            * (
+                (output["high_a"] > 0).float().mean()
+                + (output["high_b"] > 0).float().mean()
+            )
+        ),
+        "sampled_target_active_fraction": float(
+            rdm_metrics["target_active_fraction"]
+        ),
+        "sampled_target_l0": float(rdm_metrics["target_l0"]),
+        "mean_distance": (
+            float(distance.float().mean()) if distance is not None else 0.0
+        ),
     }
-    if span_length is not None:
-        metrics["mean_span_length"] = float(span_length.float().mean())
-    for value in horizon.unique().tolist():
-        selected = horizon == value
-        metrics[f"horizon_{value}_cosine"] = float(cosine[selected].mean().detach())
-        metrics[f"horizon_{value}_nrmse"] = float(
-            normalized_mse[selected].mean().detach()
-        )
-    return loss, metrics
 
 
 def _train_proposal(
-    model: TransitionJEPA,
+    model: RectifiedLpJEPASAE,
     store: ActivationStore,
     cfg: ExperimentConfig,
     *,
     pair_batch_size: int | None = None,
-    boundary_max_horizon: int | None = None,
-    description: str = "transition JEPA",
+    boundary_max_distance: int | None = None,
+    description: str = "Rectified LpJEPA-SAE",
 ) -> list[dict[str, float | int | str]]:
     device = next(model.parameters()).device
     batch_size = pair_batch_size or cfg.proposal.sweep_pairs_per_step
-    iterator = store.random_pair_batches(
+    iterator = store.random_view_pair_batches(
         batch_size,
-        max_span_length=model.cfg.window_size,
+        max_span_length=model.cfg.max_span_length,
         min_span_length=cfg.proposal.min_span_length,
-        boundary_max_horizon=boundary_max_horizon,
+        boundary_max_horizon=boundary_max_distance,
     )
-    model.set_sae_trainable(True)
     optimizer = torch.optim.AdamW(
         [
             {
-                "params": model.predictor.parameters(),
-                "lr": cfg.train.proposal_predictor_lr,
-                "base_lr": cfg.train.proposal_predictor_lr,
-            },
-            {
-                "params": model.sae.parameters(),
+                "params": model.parameters(),
                 "lr": cfg.train.proposal_sae_lr,
                 "base_lr": cfg.train.proposal_sae_lr,
             },
@@ -488,15 +601,10 @@ def _train_proposal(
         weight_decay=0.0,
         fused=device.type == "cuda",
     )
-    horizon_weights = horizon_loss_weight_table(
-        cfg.proposal.min_span_length,
-        model.cfg.window_size,
-        cfg.proposal.horizon_weighting,
-    ).to(device)
     history: list[dict[str, float | int | str]] = []
     for step in trange(1, cfg.train.branch_steps + 1, desc=description):
         joint_step = max(0, step - cfg.proposal.sae_warmup_steps)
-        phase = "sae_warmup" if joint_step == 0 else "joint"
+        phase = "distribution_warmup" if joint_step == 0 else "joint"
         for group in optimizer.param_groups:
             group["lr"] = _learning_rate(
                 step,
@@ -504,50 +612,74 @@ def _train_proposal(
                 float(group["base_lr"]),
                 min(cfg.train.warmup_steps, cfg.train.branch_steps // 10),
             )
-        prediction_weight = cfg.proposal.prediction_weight * min(
+        rdm_ramp = min(
             1.0,
-            joint_step / max(cfg.proposal.prediction_ramp_steps, 1),
+            step / max(cfg.proposal.regularization_ramp_steps, 1),
         )
-        batch = {
-            key: value.to(device, non_blocking=True)
-            for key, value in next(iterator).items()
-        }
+        invariance_ramp = min(
+            1.0,
+            joint_step / max(cfg.proposal.regularization_ramp_steps, 1),
+        )
+        active_rdm_weight = cfg.proposal.rdm_weight * rdm_ramp
+        active_invariance_weight = (
+            cfg.proposal.invariance_weight * invariance_ramp
+        )
+        should_log = (
+            step == 1
+            or step % cfg.train.log_every == 0
+            or step in {cfg.proposal.sae_warmup_steps, cfg.train.branch_steps}
+        )
         optimizer.zero_grad(set_to_none=True)
-        with _autocast(device, cfg.train.amp_dtype):
-            loss, metrics = _proposal_loss(
-                model,
-                batch["context"],
-                batch["target"],
-                batch["horizon"],
-                prediction_weight,
-                cfg,
-                span_length=batch["span_length"],
-                horizon_weight_table=horizon_weights,
-            )
-        loss.backward()
-        _project_decoder_gradient(model.sae)
+        metric_sums: dict[str, float] = {}
+        for _ in range(cfg.train.gradient_accumulation_steps):
+            batch = {
+                key: value.to(device, non_blocking=True)
+                for key, value in next(iterator).items()
+            }
+            with _autocast(device, cfg.train.amp_dtype):
+                loss, metrics = _proposal_loss(
+                    model,
+                    batch["view_a"],
+                    batch["view_b"],
+                    active_invariance_weight,
+                    active_rdm_weight,
+                    cfg,
+                    distance=batch["distance"],
+                    collect_metrics=should_log,
+                )
+                scaled_loss = loss / cfg.train.gradient_accumulation_steps
+            scaled_loss.backward()
+            for key, value in metrics.items():
+                metric_sums[key] = metric_sums.get(key, 0.0) + value
+        metrics = {
+            key: value / cfg.train.gradient_accumulation_steps
+            for key, value in metric_sums.items()
+        }
+        _project_decoder_gradient(model)
         torch.nn.utils.clip_grad_norm_(
             (p for p in model.parameters() if p.requires_grad),
             cfg.train.gradient_clip,
         )
         optimizer.step()
-        model.sae.normalize_decoder()
-        model.update_ema_sae()
-        if (
-            step == 1
-            or step % cfg.train.log_every == 0
-            or step in {cfg.proposal.sae_warmup_steps, cfg.train.branch_steps}
-        ):
+        model.normalize_decoder()
+        if should_log:
             history.append(
                 {
                     "step": step,
                     "phase": phase,
-                    "prediction_weight": prediction_weight,
-                    "window_size": model.cfg.window_size,
+                    "active_invariance_weight": active_invariance_weight,
+                    "active_rdm_weight": active_rdm_weight,
+                    "window_size": model.cfg.max_span_length,
                     "pair_batch_size": batch_size,
-                    "residual_values": 2 * batch_size,
-                    "endpoint_reconstructions": batch_size,
-                    "context_target_pairs": batch_size,
+                    "residual_values": (
+                        2 * batch_size * cfg.train.gradient_accumulation_steps
+                    ),
+                    "view_reconstructions": (
+                        2 * batch_size * cfg.train.gradient_accumulation_steps
+                    ),
+                    "exchangeable_view_pairs": (
+                        batch_size * cfg.train.gradient_accumulation_steps
+                    ),
                     **metrics,
                 }
             )
@@ -758,24 +890,29 @@ def train_all(cfg: ExperimentConfig) -> dict[str, Path]:
     )
     del temporal
 
-    proposal_cfg = TransitionJEPAConfig(
+    torch.manual_seed(cfg.train.seed)
+    proposal_cfg = RectifiedLpJEPAConfig(
         d_in=sae_cfg.d_in,
         d_sae=sae_cfg.d_sae,
-        k=sae_cfg.k,
-        window_size=cfg.proposal.window_size,
+        low_k=cfg.proposal.low_k,
+        max_span_length=cfg.proposal.window_size,
         high_fraction=cfg.proposal.high_fraction,
         high_reconstruction_weight=cfg.proposal.high_reconstruction_weight,
-        predictor_width=cfg.proposal.predictor_width,
-        predictor_expansion=cfg.proposal.predictor_expansion,
-        ema_decay=cfg.proposal.ema_decay,
+        rgg_p=cfg.proposal.rgg_p,
+        target_active_fraction=cfg.proposal.target_active_fraction,
+        target_sigma=cfg.proposal.target_sigma,
     )
-    proposal = TransitionJEPA(proposal_cfg, base).to(device)
+    proposal = RectifiedLpJEPASAE(proposal_cfg).to(device)
+    proposal.initialize_normalization(
+        torch.tensor(manifest["normalization"]["mean"]),
+        float(manifest["normalization"]["scalar_rms"]),
+    )
     del base
     history["proposal"] = _train_proposal(
         proposal,
         ActivationStore(manifest_path, cfg.train.seed + 100),
         cfg,
-        boundary_max_horizon=max(cfg.proposal.window_sizes) - 1,
+        boundary_max_distance=max(cfg.proposal.window_sizes) - 1,
     )
     proposal_path = checkpoint_dir / "proposal.pt"
     _save_checkpoint(
@@ -799,7 +936,7 @@ def train_all(cfg: ExperimentConfig) -> dict[str, Path]:
 
 
 def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
-    """Train only proposal variants, all from the saved shared SAE initialization."""
+    """Train Rectified LpJEPA variants from one identical random initialization."""
     device = torch.device(cfg.train.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
@@ -808,30 +945,27 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
     manifest_path = Path(cfg.activation_dir) / "manifest.json"
     _, manifest = load_manifest(manifest_path)
     checkpoint_dir = Path(cfg.run_dir) / "checkpoints"
-    shared_path = checkpoint_dir / "shared_initialization.pt"
-    shared = load_checkpoint(shared_path)
-    if shared["activation_config_fingerprint"] != manifest["config_fingerprint"]:
-        raise ValueError(
-            "shared initialization and activation cache use different configurations"
-        )
-    sae_cfg = SparseAutoencoderConfig(**shared["model_config"])
-    base = SparseAutoencoder(sae_cfg)
-    base.load_state_dict(shared["state_dict"])
+    d_in = int(manifest["d_in"])
 
     maximum_window = max(cfg.proposal.window_sizes)
     torch.manual_seed(cfg.train.seed)
-    template_cfg = TransitionJEPAConfig(
-        d_in=sae_cfg.d_in,
-        d_sae=sae_cfg.d_sae,
-        k=sae_cfg.k,
-        window_size=maximum_window,
+    template_cfg = RectifiedLpJEPAConfig(
+        d_in=d_in,
+        d_sae=cfg.sae.dictionary_size,
+        low_k=cfg.proposal.low_k,
+        max_span_length=maximum_window,
         high_fraction=cfg.proposal.high_fraction,
         high_reconstruction_weight=cfg.proposal.high_reconstruction_weight,
-        predictor_width=cfg.proposal.predictor_width,
-        predictor_expansion=cfg.proposal.predictor_expansion,
-        ema_decay=cfg.proposal.ema_decay,
+        rgg_p=cfg.proposal.rgg_p,
+        target_active_fraction=cfg.proposal.target_active_fraction,
+        target_sigma=cfg.proposal.target_sigma,
     )
-    template_state = TransitionJEPA(template_cfg, copy.deepcopy(base)).state_dict()
+    template = RectifiedLpJEPASAE(template_cfg)
+    template.initialize_normalization(
+        torch.tensor(manifest["normalization"]["mean"]),
+        float(manifest["normalization"]["scalar_rms"]),
+    )
+    template_state = _state_dict_cpu(template)
     paths: dict[str, Path] = {}
     histories: dict[str, Any] = {}
     budgets: dict[str, Any] = {}
@@ -839,28 +973,19 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
         if device.type == "cuda":
             torch.cuda.manual_seed_all(cfg.train.seed)
         budget = cfg.proposal.sweep_budget(window_size)
-        proposal_cfg = TransitionJEPAConfig(
-            d_in=sae_cfg.d_in,
-            d_sae=sae_cfg.d_sae,
-            k=sae_cfg.k,
-            window_size=window_size,
+        proposal_cfg = RectifiedLpJEPAConfig(
+            d_in=d_in,
+            d_sae=cfg.sae.dictionary_size,
+            low_k=cfg.proposal.low_k,
+            max_span_length=window_size,
             high_fraction=cfg.proposal.high_fraction,
             high_reconstruction_weight=cfg.proposal.high_reconstruction_weight,
-            predictor_width=cfg.proposal.predictor_width,
-            predictor_expansion=cfg.proposal.predictor_expansion,
-            ema_decay=cfg.proposal.ema_decay,
+            rgg_p=cfg.proposal.rgg_p,
+            target_active_fraction=cfg.proposal.target_active_fraction,
+            target_sigma=cfg.proposal.target_sigma,
         )
-        proposal = TransitionJEPA(proposal_cfg, copy.deepcopy(base))
-        proposal_state = proposal.state_dict()
-        for name, target in proposal_state.items():
-            source = template_state[name]
-            if source.shape == target.shape:
-                target.copy_(source)
-            elif name == "predictor.horizon_embedding.weight":
-                target.copy_(source[:window_size])
-            else:
-                raise ValueError(f"cannot share sweep initialization for {name}")
-        proposal.load_state_dict(proposal_state)
+        proposal = RectifiedLpJEPASAE(proposal_cfg)
+        proposal.load_state_dict(template_state)
         proposal.to(device)
         label = f"proposal_w{window_size:03d}"
         histories[label] = _train_proposal(
@@ -868,8 +993,8 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
             ActivationStore(manifest_path, cfg.train.seed + 100),
             cfg,
             pair_batch_size=budget["pair_batch_size"],
-            boundary_max_horizon=maximum_window - 1,
-            description=f"random-pair horizon JEPA max-span={window_size}",
+            boundary_max_distance=maximum_window - 1,
+            description=f"Rectified LpJEPA-SAE max-span={window_size}",
         )
         budget_record = {
             **budget,
@@ -877,8 +1002,8 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
             "total_residual_values": (
                 budget["residual_values_per_step"] * cfg.train.branch_steps
             ),
-            "total_endpoint_reconstructions": (
-                budget["endpoint_reconstructions_per_step"]
+            "total_reconstructions": (
+                budget["reconstructions_per_step"]
                 * cfg.train.branch_steps
             ),
             "total_sampled_pairs": (
@@ -888,8 +1013,10 @@ def train_proposal_window_sweep(cfg: ExperimentConfig) -> dict[str, Path]:
                 cfg.data.burn_in_tokens + maximum_window
             ),
             "burn_in_tokens": cfg.data.burn_in_tokens,
-            "boundary_max_horizon": maximum_window - 1,
-            "horizon_weighting": cfg.proposal.horizon_weighting,
+            "boundary_max_distance": maximum_window - 1,
+            "axis_rdm_features": min(
+                cfg.proposal.axis_rdm_features, proposal_cfg.d_high
+            ),
         }
         budgets[label] = budget_record
         path = checkpoint_dir / f"{label}.pt"

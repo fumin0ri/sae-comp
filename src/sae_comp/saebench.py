@@ -69,8 +69,10 @@ class SAEBenchAdapter(nn.Module):
         threshold: torch.Tensor,
         use_threshold: bool,
         use_group_topk: bool,
+        use_rectified_groups: bool,
         group_high_size: int,
         group_high_k: int,
+        group_low_k: int,
         k: int,
         cfg: AdapterConfig,
     ):
@@ -83,8 +85,10 @@ class SAEBenchAdapter(nn.Module):
         self.register_buffer("threshold", threshold.detach().clone())
         self.use_threshold = use_threshold
         self.use_group_topk = use_group_topk
+        self.use_rectified_groups = use_rectified_groups
         self.group_high_size = group_high_size
         self.group_high_k = group_high_k
+        self.group_low_k = group_low_k
         self.k = k
         self.cfg = cfg
         self.device = self.W_enc.device
@@ -95,6 +99,14 @@ class SAEBenchAdapter(nn.Module):
         positive = F.relu(preactivations)
         if self.use_threshold:
             code = positive * (positive > self.threshold)
+        elif self.use_rectified_groups:
+            high_code = positive[..., : self.group_high_size]
+            low = positive[..., self.group_high_size :]
+            low_selected = low.topk(self.group_low_k, dim=-1, sorted=False)
+            low_code = torch.zeros_like(low).scatter_(
+                -1, low_selected.indices, low_selected.values
+            )
+            code = torch.cat((high_code, low_code), dim=-1)
         elif self.use_group_topk:
             high = positive[..., : self.group_high_size]
             low = positive[..., self.group_high_size :]
@@ -152,20 +164,28 @@ def checkpoint_to_saebench(
         "standard": "standard-topk",
         "temporal": "temporal-batchtopk",
         "proposal": (
-            "high-low-random-pair-horizon-full-ema-"
+            "predictor-free-high-low-rectified-lpjepa-axis-rdm-"
             f"{label.removeprefix('proposal_')}"
         ),
     }[method]
     activation_fn = {
         "standard": "topk",
         "temporal": "threshold",
-        "proposal": "topk",
+        "proposal": "shifted_relu_high_topk_low",
     }[method]
     training_tokens = (
-        (cfg.train.standard_steps + cfg.train.branch_steps)
-        * cfg.train.token_batch_size
+        cfg.train.branch_steps
+        * cfg.proposal.sweep_pairs_per_step
+        * 2
         * cfg.train.gradient_accumulation_steps
+        if method == "proposal"
+        else (
+            (cfg.train.standard_steps + cfg.train.branch_steps)
+            * cfg.train.token_batch_size
+            * cfg.train.gradient_accumulation_steps
+        )
     )
+    k = sae.cfg.low_k if method == "proposal" else sae.cfg.k
     adapter_cfg = AdapterConfig(
         model_name=cfg.sae_bench.model_name,
         d_in=sae.cfg.d_in,
@@ -176,7 +196,7 @@ def checkpoint_to_saebench(
         architecture=architecture,
         activation_fn_str=activation_fn,
         activation_fn_kwargs={
-            "k": sae.cfg.k,
+            "k": k,
             **(
                 {
                     "high_size": sae.cfg.group_high_size,
@@ -184,7 +204,17 @@ def checkpoint_to_saebench(
                     "low_k": sae.cfg.group_low_k,
                     "grouped": True,
                 }
-                if sae.cfg.group_topk
+                if method != "proposal" and sae.cfg.group_topk
+                else {}
+            ),
+            **(
+                {
+                    "high_size": sae.cfg.d_high,
+                    "low_k": sae.cfg.low_k,
+                    "target_active_fraction": sae.cfg.target_active_fraction,
+                    "rectified_high": True,
+                }
+                if method == "proposal"
                 else {}
             ),
         },
@@ -199,12 +229,22 @@ def checkpoint_to_saebench(
         b_enc=sae.encoder.bias.detach().float(),
         b_dec=sae.pre_bias.detach().float(),
         feature_scale=scale,
-        threshold=sae.threshold.detach().float(),
+        threshold=(
+            sae.threshold.detach().float()
+            if method != "proposal"
+            else torch.tensor(-1.0)
+        ),
         use_threshold=method == "temporal",
-        use_group_topk=sae.cfg.group_topk,
-        group_high_size=sae.cfg.group_high_size,
-        group_high_k=sae.cfg.group_high_k,
-        k=sae.cfg.k,
+        use_group_topk=(method != "proposal" and sae.cfg.group_topk),
+        use_rectified_groups=method == "proposal",
+        group_high_size=(
+            sae.cfg.d_high if method == "proposal" else sae.cfg.group_high_size
+        ),
+        group_high_k=(0 if method == "proposal" else sae.cfg.group_high_k),
+        group_low_k=(
+            sae.cfg.low_k if method == "proposal" else sae.cfg.group_low_k
+        ),
+        k=k,
         cfg=adapter_cfg,
     )
     if not adapter.check_decoder_norms():

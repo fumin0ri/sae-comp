@@ -240,7 +240,7 @@ def _plot_overview(summary: dict[str, Any], output_dir: Path, target_l0: int) ->
         color="#222222",
         linestyle="--",
         linewidth=1.5,
-        label=f"Training target k={target_l0}",
+        label=f"Standard/Temporal target k={target_l0}",
     )
     axes[1, 1].set_title("Observed sparsity sanity check")
     axes[1, 1].set_ylabel("Mean active features (L0)")
@@ -412,17 +412,26 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
             f"- Frozen model: `{cfg.sae_bench.model_name}`, "
             f"`blocks.{cfg.model.layer}.hook_resid_post`"
         ),
-        f"- Dictionary: {cfg.sae.dictionary_size:,} features; target k={cfg.sae.k}",
+        (
+            f"- Dictionary: {cfg.sae.dictionary_size:,} features; "
+            f"Standard/Temporal target k={cfg.sae.k}"
+        ),
+        (
+            "- Proposal sparsity target: "
+            f"low k={cfg.proposal.low_k}; expected high L0="
+            f"{round(cfg.sae.dictionary_size * cfg.proposal.high_fraction) * cfg.proposal.target_active_fraction:.2f}"
+        ),
         f"- Shared pretraining: {cfg.train.standard_steps:,} steps",
-        f"- Branch training: {cfg.train.branch_steps:,} steps for every condition",
+        f"- Controlled training stage: {cfg.train.branch_steps:,} steps per condition",
         (
             "- Compared conditions: Standard Top-K SAE, Temporal SAE, and proposal "
             + ", ".join(f"W={value}" for value in cfg.proposal.window_sizes)
         ),
         (
-            f"- Proposal architecture: high/low random-pair horizon JEPA; "
+            f"- Proposal architecture: predictor-free high/low Rectified LpJEPA; "
             f"high={cfg.proposal.high_fraction:.0%}, "
-            f"low={1 - cfg.proposal.high_fraction:.0%}, independent group Top-K"
+            f"low={1 - cfg.proposal.high_fraction:.0%}; shifted-ReLU high, "
+            f"Top-K low (k={cfg.proposal.low_k})"
         ),
         (
             "- Proposal reconstruction: "
@@ -432,11 +441,11 @@ def build_saebench_report(cfg: ExperimentConfig) -> Path:
         "- Explicitly excluded SAEBench evaluations: SCR and TPP",
         "",
         (
-            "Every proposal width uses the same optimizer-step, sampled-pair, and "
-            "endpoint-reconstruction budget. W is the maximum random span length; "
-            "the latent prediction loss is inverse-probability weighted so every "
-            "supported horizon has equal expected mass. All conditions use the same "
-            "SAEBench settings."
+            "Every proposal width uses the same initialization, optimizer-step, "
+            "sampled-pair, and two-view reconstruction budget. W is the maximum "
+            "random span length. Two distinct positions are exchangeable views; "
+            "high codes are regularized by direct invariance and random/axis RDMReg. "
+            "All conditions use the same SAEBench settings."
         ),
         "",
     ]

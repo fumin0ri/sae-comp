@@ -11,7 +11,7 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
     cfg = replace(
         base,
         run_dir=str(tmp_path),
-        proposal=replace(base.proposal, window_sizes=(2, 4, 8, 16)),
+        proposal=replace(base.proposal, window_sizes=(2, 4, 8, 16, 32)),
     )
     evaluation_dir = tmp_path / "evaluation"
     evaluation_dir.mkdir()
@@ -22,6 +22,7 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
         "proposal_w004",
         "proposal_w008",
         "proposal_w016",
+        "proposal_w032",
     )
     methods = {
         label: {
@@ -40,18 +41,18 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
         }
         for label in labels
     }
-    forecasts = {
+    views = {
         label: {
-            "common_horizon_max_offset": 1,
-            "common_horizon_mean_code_cosine": 0.7,
-            "common_horizon_mean_true_minus_shuffled": 0.2,
-            "offsets": [
+            "common_max_distance": 1,
+            "common_mean_high_cosine": 0.7,
+            "common_mean_high_margin": 0.2,
+            "distances": [
                 {
-                    "offset": offset,
-                    "code_cosine": 0.7,
-                    "true_minus_shuffled": 0.2,
+                    "distance": distance,
+                    "high_cosine": 0.7,
+                    "high_margin": 0.2,
                 }
-                for offset in range(1, window_size)
+                for distance in range(1, window_size)
             ],
         }
         for label, window_size in (
@@ -59,6 +60,7 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
             ("proposal_w004", 4),
             ("proposal_w008", 8),
             ("proposal_w016", 16),
+            ("proposal_w032", 32),
         )
     }
     metrics = {
@@ -77,7 +79,7 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
             "total_temporal_pairs_per_temporal_method": 2_688_000,
         },
         "methods": methods,
-        "proposal_forecasts": forecasts,
+        "proposal_views": views,
     }
     (evaluation_dir / "controlled_metrics.json").write_text(
         json.dumps(metrics), encoding="utf-8"
@@ -114,8 +116,8 @@ def test_controlled_report_renders_all_plots(tmp_path: Path) -> None:
             {
                 "histories": {
                         label: [
-                            {"step": 1, "online_reconstruction_fvu": 0.9},
-                            {"step": 2, "online_reconstruction_fvu": 0.8},
+                            {"step": 1, "full_reconstruction_fvu": 0.9},
+                            {"step": 2, "full_reconstruction_fvu": 0.8},
                     ]
                     for label in labels
                     if label.startswith("proposal")

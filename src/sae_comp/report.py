@@ -62,19 +62,21 @@ def build_report(cfg: ExperimentConfig) -> Path:
                 f"{result['task']} | {result['sparsity']} | "
                 f"{_number(result['accuracy'])} |"
             )
-    forecast = metrics["proposal_forecast"]
+    views = metrics["proposal_views"]
     lines.extend(
         [
             "",
-            "## Proposal-specific forecast diagnostic",
+            "## Proposal shared-view diagnostic",
             "",
-            f"- Mean target-code cosine: {_number(forecast['mean_code_cosine'])}",
-            "- Mean true-context minus shuffled-context cosine: "
-            f"{_number(forecast['mean_true_minus_shuffled'])}",
+            f"- Mean same-span high cosine: {_number(views['mean_high_cosine'])}",
+            ("- Mean same-span minus shuffled high cosine: "
+            f"{_number(views['mean_high_margin'])}"),
+            f"- Same-span high swap FVU: {_number(views['swap_fvu'])}",
+            f"- Shuffled high swap FVU: {_number(views['shuffled_swap_fvu'])}",
             "",
-            "This forecast diagnostic is not a three-way common metric. "
+            ("This shared-view diagnostic is not a three-way common metric. "
             "The common reconstruction, smoothness, and probe tables are the "
-            "confirmatory cross-method comparison.",
+            "confirmatory cross-method comparison."),
             "",
         ]
     )
@@ -105,14 +107,14 @@ def build_window_sweep_report(cfg: ExperimentConfig) -> Path:
     lines = [
         "# Proposal maximum-span sweep",
         "",
-        "Every condition uses the same shared SAE initialization, optimizer-step "
-        "count, random-pair batch, endpoint-reconstruction count, and long-sequence "
+        ("Every condition uses the same random initialization, optimizer-step "
+        "count, exchangeable-view pair batch, reconstruction count, and long-sequence "
         "pool. W is the maximum sampled span length, not a stored window boundary. "
-        "Span length is uniform in 2..W and one context is sampled per endpoint.",
+        "Span length is uniform in 2..W and two distinct positions are sampled."),
         "",
-        "| Max span W | Pair batch | Horizon support | Total sampled pairs | "
-        "Total endpoint reconstructions | FVE | Cosine | Alive | L0 | "
-        "Forecast cosine (common h) | True-shuffled (common h) |",
+        ("| Max span W | Pair batch | Distance support | Total sampled pairs | "
+        "Total reconstructions | FVE | Cosine | Alive | L0 | "
+        "High cosine (common d) | Same-shuffled margin (common d) |"),
         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for window_size in cfg.proposal.window_sizes:
@@ -120,22 +122,22 @@ def build_window_sweep_report(cfg: ExperimentConfig) -> Path:
         values = metrics[label]
         budget = values["training_budget"]
         common = values["common"]
-        forecast = values["forecast"]
+        views = values["views"]
         lines.append(
             "| "
             + " | ".join(
                 [
                     str(window_size),
                     str(budget["pair_batch_size"]),
-                    f"1..{budget['maximum_horizon']}",
+                    f"1..{budget['maximum_distance']}",
                     str(budget["total_sampled_pairs"]),
-                    str(budget["total_endpoint_reconstructions"]),
+                    str(budget["total_reconstructions"]),
                     _number(common["fve"]),
                     _number(common["cosine_similarity"]),
                     _number(common["fraction_alive"]),
                     _number(common["l0"]),
-                    _number(forecast["common_horizon_mean_code_cosine"]),
-                    _number(forecast["common_horizon_mean_true_minus_shuffled"]),
+                    _number(views["common_mean_high_cosine"]),
+                    _number(views["common_mean_high_margin"]),
                 ]
             )
             + " |"
@@ -160,10 +162,10 @@ def build_window_sweep_report(cfg: ExperimentConfig) -> Path:
     lines.extend(
         [
             "",
-            f"The table compares the common forecast horizons 1.."
-            f"{min(cfg.proposal.window_sizes) - 1}. All-horizon means and "
-            "horizon-wise results are retained in "
-            "`evaluation/window_sweep.json`.",
+            (f"The table compares the common token distances 1.."
+            f"{min(cfg.proposal.window_sizes) - 1}. All-distance means and "
+            "distance-wise results are retained in "
+            "`evaluation/window_sweep.json`."),
             "",
         ]
     )
@@ -199,35 +201,35 @@ def build_controlled_report(cfg: ExperimentConfig) -> Path:
         "",
         "## Experimental setup",
         "",
-        f"- Frozen model: `{experiment['model']}` revision "
-        f"`{experiment['revision']}`, layer {experiment['layer']}",
+        (f"- Frozen model: `{experiment['model']}` revision "
+        f"`{experiment['revision']}`, layer {experiment['layer']}"),
         f"- SAE: {experiment['dictionary_size']:,} features, target k={experiment['k']}",
         f"- Shared standard pretraining: {cfg.train.standard_steps:,} steps",
-        f"- Controlled branch training: {experiment['branch_optimizer_steps']:,} "
-        "steps per method",
-        f"- Data pool: sequences with at least "
-        f"{experiment['minimum_sequence_length']} valid tokens",
+        (f"- Controlled branch training: {experiment['branch_optimizer_steps']:,} "
+        "steps per method"),
+        (f"- Data pool: sequences with at least "
+        f"{experiment['minimum_sequence_length']} valid tokens"),
         f"- Seed: {experiment['seed']}",
         "",
-        "The Pythia-160m layer-8, 16k-feature, k=20 configuration follows the "
+        ("The Pythia-160m layer-8, 16k-feature, k=20 configuration follows the "
         "Temporal SAE paper's principal Pythia setup. Standard uses global "
-        "token-wise Top-K; the random-pair proposal uses independent high/low "
-        "Top-K budgets; Temporal SAE uses BatchTopK training.",
+        "token-wise Top-K; Rectified LpJEPA uses shifted-ReLU high features and "
+        "Top-K only for low features; Temporal SAE uses BatchTopK training."),
         "",
         "## Controlled branch-training budget",
         "",
-        "| Method | Pair batch | Residual values/step | Reconstruction "
-        "targets/step | Predictive pairs/step | Total reconstruction targets |",
+        ("| Method | Pair batch | Residual values/step | Reconstruction "
+        "targets/step | View pairs/step | Total reconstruction targets |"),
         "|---|---:|---:|---:|---:|---:|",
     ]
     total_tokens = experiment["total_reconstruction_tokens_per_method"]
     lines.extend(
         [
-            f"| Standard Top-K | - | {cfg.train.token_batch_size} | "
-            f"{cfg.train.token_batch_size} | - | {total_tokens:,} |",
-            f"| Temporal SAE | - | {cfg.train.token_batch_size} | "
+            (f"| Standard Top-K | - | {cfg.train.token_batch_size} | "
+            f"{cfg.train.token_batch_size} | - | {total_tokens:,} |"),
+            (f"| Temporal SAE | - | {cfg.train.token_batch_size} | "
             f"{cfg.train.token_batch_size} | {cfg.train.temporal_pairs_per_step} | "
-            f"{total_tokens:,} |",
+            f"{total_tokens:,} |"),
         ]
     )
     for window_size in cfg.proposal.window_sizes:
@@ -235,19 +237,19 @@ def build_controlled_report(cfg: ExperimentConfig) -> Path:
             lines.append(
                 f"| Proposal W={window_size} | {budget['pair_batch_size']} | "
                 f"{budget['residual_values_per_step']} | "
-                f"{budget['endpoint_reconstructions_per_step']} | "
+                f"{budget['reconstructions_per_step']} | "
                 f"{budget['sampled_pairs_per_step']} | {total_tokens:,} |"
             )
     lines.extend(
         [
             "",
-            "Method-specific objectives and optimizers are preserved; forcing them "
-            "to be identical would change the methods being compared.",
+            ("Method-specific objectives and optimizers are preserved; forcing them "
+            "to be identical would change the methods being compared."),
             "",
             "## Common metrics",
             "",
-            "| Method | FVE | Reconstruction cosine | Alive fraction | L0 | "
-            "Lipschitz | Fourier | Wavelet | Multiscale |",
+            ("| Method | FVE | Reconstruction cosine | Alive fraction | L0 | "
+            "Lipschitz | Fourier | Wavelet | Multiscale |"),
             "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
@@ -281,20 +283,20 @@ def build_controlled_report(cfg: ExperimentConfig) -> Path:
     lines.extend(
         [
             "",
-            "## Proposal forecast diagnostic",
+            "## Proposal shared-view diagnostic",
             "",
-            f"All proposal means below use the common forecast-horizon range 1.."
-            f"{min(cfg.proposal.window_sizes) - 1}.",
+            (f"All proposal means below use the common token-distance range 1.."
+            f"{min(cfg.proposal.window_sizes) - 1}."),
             "",
-            "| Method | Target-code cosine | True minus shuffled cosine |",
+            "| Method | Same-span high cosine | Same minus shuffled cosine |",
             "|---|---:|---:|",
         ]
     )
-    for label, forecast in metrics["proposal_forecasts"].items():
+    for label, views in metrics["proposal_views"].items():
         lines.append(
             f"| {display_name(label)} | "
-            f"{_number(forecast['common_horizon_mean_code_cosine'])} | "
-            f"{_number(forecast['common_horizon_mean_true_minus_shuffled'])} |"
+            f"{_number(views['common_mean_high_cosine'])} | "
+            f"{_number(views['common_mean_high_margin'])} |"
         )
     lines.extend(["", "## Figures", ""])
     for path in plot_paths:
@@ -309,9 +311,9 @@ def build_controlled_report(cfg: ExperimentConfig) -> Path:
         )
     lines.extend(
         [
-            "Raw machine-readable results are in "
+            ("Raw machine-readable results are in "
             "`evaluation/controlled_metrics.json` and "
-            "`evaluation/controlled_probes.json`.",
+            "`evaluation/controlled_probes.json`."),
             "",
         ]
     )
